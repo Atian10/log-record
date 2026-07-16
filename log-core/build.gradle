@@ -1,0 +1,22 @@
+// log-core 模块构建脚本
+// 纯 Java SE 实现，零平台依赖
+
+apply plugin: 'java-library'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    // JSON 处理（user_fields 序列化）
+    api 'com.google.code.gson:gson:2.10.1'
+
+    // 单元测试
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// 编码统一 UTF-8
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
