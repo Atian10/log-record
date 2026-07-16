@@ -1,0 +1,25 @@
+// log-desktop 模块构建脚本
+// 桌面/服务器适配（JDBC SQLite + Console）
+
+apply plugin: 'java-library'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    // 依赖核心模块
+    api project(':log-core')
+
+    // SQLite JDBC 驱动
+    implementation 'org.xerial:sqlite-jdbc:3.42.0.0'
+
+    // 单元测试
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// 编码统一 UTF-8
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
