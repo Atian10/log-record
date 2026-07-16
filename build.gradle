@@ -1,0 +1,25 @@
+// 根构建脚本
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // Android 构建插件
+        classpath 'com.android.tools.build:gradle:7.4.2'
+    }
+}
+
+// 全局仓库配置
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+// 清理任务：删除根模块及所有子模块的 build 目录
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+    delete subprojects.collect { it.buildDir }
+}

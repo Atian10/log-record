@@ -1,0 +1,16 @@
+// 多模块配置
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'log-record'
+
+include ':log-core'
+include ':log-android'
+include ':log-desktop'
+include ':log-sample'
+include ':log-sample-android'
