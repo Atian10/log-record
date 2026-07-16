@@ -1,0 +1,47 @@
+// log-android 模块构建脚本
+// Android 平台适配（Room + Logcat）
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.atian10.logrecord.android'
+    compileSdk 33
+
+    defaultConfig {
+        minSdk 21
+        targetSdk 33
+
+        // Room schema 导出位置
+        javaCompileOptions {
+            annotationProcessorOptions {
+                arguments += ["room.schemaLocation": "$projectDir/schemas".toString()]
+            }
+        }
+
+        // 消费方 ProGuard 规则自动传递
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // 纯代码库，关闭非必要构建特性以加速构建
+    buildFeatures {
+        buildConfig false
+        resValues false
+    }
+}
+
+dependencies {
+    // 依赖核心模块
+    api project(':log-core')
+
+    // Room 数据库
+    implementation 'androidx.room:room-runtime:2.5.2'
+    annotationProcessor 'androidx.room:room-compiler:2.5.2'
+
+    // AndroidX 注解
+    implementation 'androidx.annotation:annotation:1.6.0'
+}
