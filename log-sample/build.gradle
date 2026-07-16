@@ -1,0 +1,19 @@
+// log-sample 模块构建脚本
+// 桌面/服务器使用示例（纯 Java）
+
+apply plugin: 'java'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    // 桌面示例依赖 log-desktop
+    implementation project(':log-desktop')
+}
+
+// 编码统一 UTF-8
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}

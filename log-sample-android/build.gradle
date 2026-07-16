@@ -1,0 +1,33 @@
+// log-sample-android 模块构建脚本
+// Android 应用示例（演示 Android 平台接入）
+
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.atian10.logrecord.sample.android'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.atian10.logrecord.sample.android"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // 纯代码示例，关闭非必要构建特性
+    buildFeatures {
+        buildConfig false
+        resValues false
+    }
+}
+
+dependencies {
+    // 依赖 Android 适配模块
+    implementation project(':log-android')
+}
