@@ -30,4 +30,6 @@ android {
 dependencies {
     // 依赖 Android 适配模块
     implementation project(':log-android')
+    // 显式声明 log-core 依赖（log-android 已通过 api 传递，显式声明提高依赖透明度）
+    implementation project(':log-core')
 }

@@ -7,7 +7,7 @@
 #   - 本库 Storage 类：业务方通过 AndroidLogInit 装配，需保留公共 API
 
 # ===== 基础保留属性（所有模块通用，建议保留） =====
--keepattributes Signature, *Annotation*, SourceFile, LineNumberTable
+-keepattributes Signature, *Annotation*, SourceFile, LineNumberTable, InnerClasses, EnclosingMethod
 -keep public class * extends java.lang.Exception
 
 # ===== Room Entity keep（Room 编译器生成的代码需要保留，来源：androidx.room 官方） =====

@@ -11,6 +11,8 @@ java {
 dependencies {
     // 桌面示例依赖 log-desktop
     implementation project(':log-desktop')
+    // 显式声明 log-core 依赖（log-desktop 已通过 api 传递，显式声明提高依赖透明度）
+    implementation project(':log-core')
 }
 
 // 编码统一 UTF-8

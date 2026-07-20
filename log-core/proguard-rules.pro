@@ -13,7 +13,7 @@
 #   - 枚举：LogLevel/OrderBy/ExportFormat 等用于 switch 和反射，需保留
 
 # ===== 基础保留属性（所有模块通用，建议保留） =====
--keepattributes Signature, *Annotation*, SourceFile, LineNumberTable
+-keepattributes Signature, *Annotation*, SourceFile, LineNumberTable, InnerClasses, EnclosingMethod
 -keep public class * extends java.lang.Exception
 
 # ===== 核心数据模型 keep（Gson 反射序列化 user_fields，字段名必须保留） =====

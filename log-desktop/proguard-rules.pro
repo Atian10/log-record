@@ -10,7 +10,7 @@
 #   - 本库 Storage 类：业务方通过 AndroidLogInit/DesktopLogInit 反射或直接调用
 
 # ===== 基础保留属性（所有模块通用，建议保留） =====
--keepattributes Signature, *Annotation*, SourceFile, LineNumberTable
+-keepattributes Signature, *Annotation*, SourceFile, LineNumberTable, InnerClasses, EnclosingMethod
 -keep public class * extends java.lang.Exception
 
 # ===== SQLite JDBC 驱动 keep（反射加载驱动类，来源：xerial/sqlite-jdbc 官方） =====
