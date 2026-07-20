@@ -9,6 +9,7 @@ import com.atian10.logrecord.core.model.LogRecord;
 import com.atian10.logrecord.core.query.LogQuery;
 import com.atian10.logrecord.core.query.LogStatistics;
 import com.atian10.logrecord.core.query.OrderBy;
+import com.atian10.logrecord.core.util.LikeEscapeUtil;
 import com.atian10.logrecord.android.room.LogDao;
 import com.atian10.logrecord.android.room.LogDatabase;
 import com.atian10.logrecord.android.room.LogEntity;
@@ -224,8 +225,8 @@ public final class RoomStorage implements IStorage {
             hasWhere = true;
         }
         if (query.getKeyword() != null) {
-            sql.append(hasWhere ? " AND " : " WHERE ").append("message LIKE ?");
-            args.add("%" + query.getKeyword() + "%");
+            sql.append(hasWhere ? " AND " : " WHERE ").append("message LIKE ? ESCAPE '\\'");
+            args.add(LikeEscapeUtil.contains(query.getKeyword()));
             hasWhere = true;
         }
         if (query.getFromTime() != null) {
@@ -243,12 +244,13 @@ public final class RoomStorage implements IStorage {
             args.add(query.getVersionTag());
             hasWhere = true;
         }
-        // userFields 键值对查询：LIKE 模糊匹配 JSON
+        // userFields 键值对查询：LIKE 模糊匹配 JSON（转义 key/value 中的特殊字符）
         if (query.getUserFields() != null && !query.getUserFields().isEmpty()) {
             for (Map.Entry<String, String> e : query.getUserFields().entrySet()) {
                 sql.append(hasWhere ? " AND " : " WHERE ")
-                        .append("user_fields LIKE ?");
-                args.add("%\"" + e.getKey() + "\":\"" + e.getValue() + "\"%");
+                        .append("user_fields LIKE ? ESCAPE '\\'");
+                args.add("%\"" + LikeEscapeUtil.escape(e.getKey())
+                        + "\":\"" + LikeEscapeUtil.escape(e.getValue()) + "\"%");
                 hasWhere = true;
             }
         }

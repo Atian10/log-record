@@ -8,6 +8,7 @@ import com.atian10.logrecord.core.query.LogQuery;
 import com.atian10.logrecord.core.query.LogStatistics;
 import com.atian10.logrecord.core.query.OrderBy;
 import com.atian10.logrecord.core.util.JsonUtil;
+import com.atian10.logrecord.core.util.LikeEscapeUtil;
 import com.atian10.logrecord.desktop.jdbc.JdbcHelper;
 import com.atian10.logrecord.desktop.jdbc.LogTableSchema;
 
@@ -330,8 +331,8 @@ public final class JdbcStorage implements IStorage {
             hasWhere = true;
         }
         if (query.getKeyword() != null) {
-            sql.append(hasWhere ? " AND " : " WHERE ").append("message LIKE ?");
-            args.add("%" + query.getKeyword() + "%");
+            sql.append(hasWhere ? " AND " : " WHERE ").append("message LIKE ? ESCAPE '\\'");
+            args.add(LikeEscapeUtil.contains(query.getKeyword()));
             hasWhere = true;
         }
         if (query.getFromTime() != null) {
@@ -352,8 +353,9 @@ public final class JdbcStorage implements IStorage {
         if (query.getUserFields() != null && !query.getUserFields().isEmpty()) {
             for (Map.Entry<String, String> e : query.getUserFields().entrySet()) {
                 sql.append(hasWhere ? " AND " : " WHERE ")
-                        .append("user_fields LIKE ?");
-                args.add("%\"" + e.getKey() + "\":\"" + e.getValue() + "\"%");
+                        .append("user_fields LIKE ? ESCAPE '\\'");
+                args.add("%\"" + LikeEscapeUtil.escape(e.getKey())
+                        + "\":\"" + LikeEscapeUtil.escape(e.getValue()) + "\"%");
                 hasWhere = true;
             }
         }

@@ -5,6 +5,7 @@ import com.atian10.logrecord.core.config.CleanPolicy;
 import com.atian10.logrecord.core.model.ExceptionRecord;
 import com.atian10.logrecord.core.query.ExceptionQuery;
 import com.atian10.logrecord.core.query.OrderBy;
+import com.atian10.logrecord.core.util.LikeEscapeUtil;
 import com.atian10.logrecord.desktop.jdbc.JdbcHelper;
 import com.atian10.logrecord.desktop.jdbc.LogTableSchema;
 
@@ -210,8 +211,8 @@ public final class JdbcExceptionStorage implements IExceptionStorage {
             hasWhere = true;
         }
         if (query.getKeyword() != null) {
-            sql.append(hasWhere ? " AND " : " WHERE ").append("exception_msg LIKE ?");
-            args.add("%" + query.getKeyword() + "%");
+            sql.append(hasWhere ? " AND " : " WHERE ").append("exception_msg LIKE ? ESCAPE '\\'");
+            args.add(LikeEscapeUtil.contains(query.getKeyword()));
             hasWhere = true;
         }
         if (query.getFromTime() != null) {
