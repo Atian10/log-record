@@ -91,16 +91,41 @@ public final class CleanTask {
     }
 
     /**
-     * 运行时更新清理策略（无需重启调度，下一轮调度生效）
+     * 运行时更新清理策略
+     * <p>
+     * 若原策略均未启用导致调度未启动，而新策略至少有一项启用，则自动启动调度
+     * （修复初始 enabled=false 后 updatePolicies 改为 true 调度不启动的缺陷）。
+     * 若调度已启动，仅替换 volatile 策略引用，下一轮调度生效（周期不重建）。
+     * </p>
      * @param logCleanPolicy 日志清理策略
      * @param exceptionCleanPolicy 异常清理策略
      */
-    public void updatePolicies(CleanPolicy logCleanPolicy,
-                               CleanPolicy exceptionCleanPolicy) {
-        this.logCleanPolicy = logCleanPolicy == null
+    public synchronized void updatePolicies(CleanPolicy logCleanPolicy,
+                                            CleanPolicy exceptionCleanPolicy) {
+        CleanPolicy newLogPolicy = logCleanPolicy == null
                 ? CleanPolicy.builder().build() : logCleanPolicy;
-        this.exceptionCleanPolicy = exceptionCleanPolicy == null
+        CleanPolicy newExpPolicy = exceptionCleanPolicy == null
                 ? CleanPolicy.builder().build() : exceptionCleanPolicy;
+
+        // 检测是否需要从"未启用"切换为"启用"并自动启动调度
+        boolean wasEnabled = (this.logCleanPolicy != null && this.logCleanPolicy.isEnabled())
+                || (this.exceptionCleanPolicy != null && this.exceptionCleanPolicy.isEnabled());
+        boolean nowEnabled = newLogPolicy.isEnabled() || newExpPolicy.isEnabled();
+
+        this.logCleanPolicy = newLogPolicy;
+        this.exceptionCleanPolicy = newExpPolicy;
+
+        // 原来未启用导致调度未启动，现在启用则自动启动调度
+        if (!wasEnabled && nowEnabled && !running) {
+            // 取较短的清理周期（最少 1 小时）
+            int intervalHours = Math.max(1, Math.min(
+                    newLogPolicy.getCleanIntervalHours(),
+                    newExpPolicy.getCleanIntervalHours()));
+            long intervalMillis = (long) intervalHours * 60L * 60L * 1000L;
+            scheduledFuture = scheduler.scheduleWithFixedDelay(
+                    this::cleanInternal, intervalMillis, intervalMillis, TimeUnit.MILLISECONDS);
+            running = true;
+        }
     }
 
     /**
