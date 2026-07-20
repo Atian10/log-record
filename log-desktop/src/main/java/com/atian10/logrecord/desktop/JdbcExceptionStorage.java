@@ -94,6 +94,7 @@ public final class JdbcExceptionStorage implements IExceptionStorage {
             return 0;
         }
         int cleaned = 0;
+        // 按天数清理
         if (policy.getKeepDays() > 0) {
             long threshold = System.currentTimeMillis()
                     - (long) policy.getKeepDays() * 24L * 60L * 60L * 1000L;
@@ -104,6 +105,19 @@ public final class JdbcExceptionStorage implements IExceptionStorage {
             } catch (SQLException ignored) {
             }
         }
+        // 按容量清理（超限时按数量保留当前的一半，与 JdbcStorage 行为一致）
+        long maxSizeBytes = policy.getMaxDbSizeMB() * 1024L * 1024L;
+        if (maxSizeBytes > 0 && helper.getDbSizeBytes() > maxSizeBytes) {
+            long currentCount = getRecordCount();
+            try {
+                cleaned += helper.executeUpdate(
+                        "DELETE FROM exception_table WHERE id NOT IN ("
+                                + "SELECT id FROM exception_table ORDER BY timestamp DESC LIMIT ?)",
+                        new Object[]{Math.max(1, currentCount / 2)});
+            } catch (SQLException ignored) {
+            }
+        }
+        // 按数量清理
         if (policy.getMaxRecordCount() > 0 && getRecordCount() > policy.getMaxRecordCount()) {
             try {
                 cleaned += helper.executeUpdate(

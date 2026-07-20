@@ -92,11 +92,19 @@ public final class RoomExceptionStorage implements IExceptionStorage {
             return 0;
         }
         int cleaned = 0;
+        // 按天数清理
         if (policy.getKeepDays() > 0) {
             long threshold = System.currentTimeMillis()
                     - (long) policy.getKeepDays() * 24L * 60L * 60L * 1000L;
             cleaned += dao.cleanBefore(threshold);
         }
+        // 按容量清理（超限时按数量保留当前的一半，与 RoomStorage 行为一致）
+        long maxSizeBytes = policy.getMaxDbSizeMB() * 1024L * 1024L;
+        if (maxSizeBytes > 0 && getDbSizeBytes() > maxSizeBytes) {
+            long currentCount = dao.countAll();
+            cleaned += dao.cleanByCount((int) Math.max(1, currentCount / 2));
+        }
+        // 按数量清理
         if (policy.getMaxRecordCount() > 0 && dao.countAll() > policy.getMaxRecordCount()) {
             cleaned += dao.cleanByCount((int) policy.getMaxRecordCount());
         }
