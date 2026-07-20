@@ -1,6 +1,7 @@
 package com.atian10.logrecord.android;
 
 import android.content.Context;
+import android.util.Log;
 
 import androidx.room.Room;
 import androidx.room.RoomDatabase;
@@ -16,11 +17,20 @@ import com.atian10.logrecord.android.room.LogDatabaseMigrations;
  * Android 平台初始化入口
  * <p>
  * 封装 LogDatabase 构建 + RoomStorage/RoomExceptionStorage/LogcatStorage 装配 +
- * LogManager 初始化。业务方调用 {@link #init(Context, LogConfig)} 完成接入。
+ * LogManager 初始化。业务方调用 {@link #init(Context, LogConfig.Builder)} 完成接入。
  * </p>
  * <p>
  * 数据库位置：{@code context.getDatabasePath("log_record.db")}，由 Room 自动管理。
  * WAL 模式：Room 默认在 API 16+ 开启 writeAheadLogging，无需额外配置。
+ * </p>
+ * <p>
+ * <b>多进程限制</b>：本库不支持多进程并发访问同一 SQLite 文件。若业务方在多进程
+ * （如 {@code :remote} process）中调用 init，会构建多个 RoomDatabase 实例同时打开
+ * 同一文件，可能导致数据库锁竞争或损坏。多进程场景请使用 ContentProvider 中转或独立 DB。
+ * </p>
+ * <p>
+ * <b>debug/release 区分</b>：本库关闭了 BuildConfig 生成，建议业务方通过
+ * {@code LogConfig.versionTag} 主动标识构建类型（如 "1.0.0-debug" / "1.0.0-release"）。
  * </p>
  * <p>
  * 使用示例：
@@ -52,6 +62,7 @@ public final class AndroidLogInit {
      * <p>
      * 内部完成：
      * <ol>
+     *   <li>若已初始化，直接返回现有实例（防重复调用导致 DB 连接泄漏）</li>
      *   <li>构建 LogDatabase（含迁移注册）</li>
      *   <li>构建 RoomStorage（若 consoleEnabled=true，用 LogcatStorage 装饰）</li>
      *   <li>构建 RoomExceptionStorage</li>
@@ -62,14 +73,17 @@ public final class AndroidLogInit {
      * @param context Android Context（建议用 ApplicationContext 避免泄漏）
      * @param configBuilder 配置构建器（storage/exceptionStorage 字段会被本方法覆盖）
      * @return LogManager 实例
-     * @throws IllegalStateException 重复初始化时抛出
      */
-    public static LogManager init(Context context, LogConfig.Builder configBuilder) {
+    public static synchronized LogManager init(Context context, LogConfig.Builder configBuilder) {
         if (context == null) {
             throw new NullPointerException("context == null");
         }
         if (configBuilder == null) {
             throw new NullPointerException("configBuilder == null");
+        }
+        // 防重复调用：已初始化直接返回现有实例，避免重复构建 DB 导致连接泄漏
+        if (LogManager.isInitialized()) {
+            return LogManager.get();
         }
         Context appContext = context.getApplicationContext();
 
@@ -124,7 +138,9 @@ public final class AndroidLogInit {
         if (database != null) {
             try {
                 database.close();
-            } catch (Throwable ignored) {
+            } catch (Throwable t) {
+                // 关闭失败不阻塞，但输出到 logcat 便于业务方诊断
+                Log.w("LogRecord", "database.close() failed: " + t.getMessage(), t);
             }
             database = null;
         }
@@ -145,8 +161,9 @@ public final class AndroidLogInit {
             // 执行 WAL pragma（Room 默认已开启，此处显式设置保证一致性）
             sqlite.execSQL("PRAGMA journal_mode=WAL");
             sqlite.execSQL("PRAGMA synchronous=NORMAL");
-        } catch (Throwable ignored) {
-            // pragma 失败不阻塞初始化
+        } catch (Throwable t) {
+            // pragma 失败不阻塞初始化，但输出到 logcat 便于业务方诊断
+            Log.w("LogRecord", "PRAGMA setup failed (non-blocking): " + t.getMessage(), t);
         }
         return db;
     }

@@ -1,6 +1,7 @@
 package com.atian10.logrecord.desktop.jdbc;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
@@ -47,8 +48,8 @@ public final class JdbcMigrations {
      * @throws SQLException 查询失败
      */
     public static int getUserVersion(Connection connection) throws SQLException {
-        try (Statement stmt = connection.createStatement()) {
-            java.sql.ResultSet rs = stmt.executeQuery("PRAGMA user_version");
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("PRAGMA user_version")) {
             if (rs.next()) {
                 return rs.getInt(1);
             }

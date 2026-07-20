@@ -41,6 +41,18 @@ public final class DesktopLogInit {
 
     /**
      * 初始化日志库（桌面/服务器平台）
+     * <p>等价于 {@code init(dbPath, configBuilder, false)}，不注册 ShutdownHook</p>
+     * @param dbPath 数据库文件路径
+     * @param configBuilder 配置构建器（storage/exceptionStorage 字段会被本方法覆盖）
+     * @return LogManager 实例
+     * @throws IllegalStateException 重复初始化或数据库初始化失败时抛出
+     */
+    public static LogManager init(String dbPath, LogConfig.Builder configBuilder) {
+        return init(dbPath, configBuilder, false);
+    }
+
+    /**
+     * 初始化日志库（桌面/服务器平台）
      * <p>
      * 内部完成：
      * <ol>
@@ -50,14 +62,17 @@ public final class DesktopLogInit {
      *   <li>构建 JdbcExceptionStorage</li>
      *   <li>用平台适配的 storage 替换原 config 中的 storage/exceptionStorage</li>
      *   <li>调用 LogManager.init</li>
+     *   <li>若 registerShutdownHook=true，注册 JVM ShutdownHook 在进程退出时调用 shutdown()</li>
      * </ol>
      * </p>
      * @param dbPath 数据库文件路径
      * @param configBuilder 配置构建器（storage/exceptionStorage 字段会被本方法覆盖）
+     * @param registerShutdownHook 是否注册 JVM ShutdownHook，进程退出时自动关闭日志库
      * @return LogManager 实例
      * @throws IllegalStateException 重复初始化或数据库初始化失败时抛出
      */
-    public static LogManager init(String dbPath, LogConfig.Builder configBuilder) {
+    public static LogManager init(String dbPath, LogConfig.Builder configBuilder,
+                                  boolean registerShutdownHook) {
         if (dbPath == null || dbPath.isEmpty()) {
             throw new IllegalArgumentException("dbPath is null or empty");
         }
@@ -109,7 +124,15 @@ public final class DesktopLogInit {
                 .consoleEnabled(false)
                 .build();
 
-        return LogManager.init(finalConfig);
+        LogManager manager = LogManager.init(finalConfig);
+
+        // 7. 可选注册 JVM ShutdownHook
+        if (registerShutdownHook) {
+            Runtime.getRuntime().addShutdownHook(new Thread(DesktopLogInit::shutdown,
+                    "log-record-shutdown-hook"));
+        }
+
+        return manager;
     }
 
     /**
