@@ -123,8 +123,15 @@ public final class ExceptionQuery {
             return this;
         }
 
+        /**
+         * 设置排序方式
+         * @param orderBy 排序枚举；传 null 时保持默认值 {@link OrderBy#DESC}（不覆盖）
+         * @return 当前 Builder
+         */
         public Builder orderBy(OrderBy orderBy) {
-            this.orderBy = orderBy;
+            if (orderBy != null) {
+                this.orderBy = orderBy;
+            }
             return this;
         }
 
