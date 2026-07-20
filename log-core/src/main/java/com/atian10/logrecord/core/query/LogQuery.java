@@ -2,6 +2,7 @@ package com.atian10.logrecord.core.query;
 
 import com.atian10.logrecord.core.model.LogLevel;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -56,7 +57,7 @@ public final class LogQuery {
         this.toTime = builder.toTime;
         this.userFields = builder.userFields == null
                 ? null
-                : new HashMap<>(builder.userFields);
+                : Collections.unmodifiableMap(new HashMap<>(builder.userFields));
         this.versionTag = builder.versionTag;
         this.orderBy = builder.orderBy;
         this.offset = builder.offset;
