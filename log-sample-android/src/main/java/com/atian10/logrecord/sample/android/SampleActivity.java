@@ -60,7 +60,8 @@ public class SampleActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(32, 32, 32, 32);
-        scroll.setContentView(root);
+        // ScrollView 通过 addView 添加唯一子视图（setContentView 是既有缺陷，ScrollView 无此方法）
+        scroll.addView(root);
 
         TextView title = new TextView(this);
         title.setText("LogRecord Android 示例");
@@ -142,72 +143,84 @@ public class SampleActivity extends Activity {
     // ===== 查询示例 =====
 
     private void queryErrorLogs() {
-        try {
-            long now = System.currentTimeMillis();
-            long oneHourAgo = now - 3600_000L;
-            List<LogRecord> records = mLogger.queryLogs(LogQuery.builder()
-                    .level(LogLevel.ERROR)
-                    .fromTime(oneHourAgo)
-                    .toTime(now)
-                    .orderBy(OrderBy.DESC)
-                    .limit(20)
-                    .build());
-            StringBuilder sb = new StringBuilder();
-            sb.append("查询到 ").append(records.size()).append(" 条 ERROR 日志：\n");
-            for (LogRecord r : records) {
-                sb.append("  [").append(r.getLevel()).append("] ")
-                        .append(r.getTag()).append(" : ").append(r.getMessage())
-                        .append("\n");
+        // 数据库查询必须在子线程执行，避免主线程阻塞导致 ANR
+        new Thread(() -> {
+            try {
+                long now = System.currentTimeMillis();
+                long oneHourAgo = now - 3600_000L;
+                List<LogRecord> records = mLogger.queryLogs(LogQuery.builder()
+                        .level(LogLevel.ERROR)
+                        .fromTime(oneHourAgo)
+                        .toTime(now)
+                        .orderBy(OrderBy.DESC)
+                        .limit(20)
+                        .build());
+                StringBuilder sb = new StringBuilder();
+                sb.append("查询到 ").append(records.size()).append(" 条 ERROR 日志：\n");
+                for (LogRecord r : records) {
+                    sb.append("  [").append(r.getLevel()).append("] ")
+                            .append(r.getTag()).append(" : ").append(r.getMessage())
+                            .append("\n");
+                }
+                runOnUiThread(() -> appendOutput(sb.toString()));
+            } catch (Throwable t) {
+                Log.e(TAG, "queryErrorLogs failed", t);
+                runOnUiThread(() -> appendOutput("查询失败: " + t.getMessage()));
             }
-            appendOutput(sb.toString());
-        } catch (Throwable t) {
-            Log.e(TAG, "queryErrorLogs failed", t);
-        }
+        }, "query-error-logs").start();
     }
 
     private void showStatistics() {
-        try {
-            long now = System.currentTimeMillis();
-            long oneDayAgo = now - 86_400_000L;
-            LogStatistics stats = mLogger.statistics(LogQuery.builder()
-                    .fromTime(oneDayAgo)
-                    .toTime(now)
-                    .build());
-            StringBuilder sb = new StringBuilder();
-            sb.append("聚合统计（最近 24h）：\n");
-            sb.append("  总数: ").append(stats.getTotalCount()).append("\n");
-            sb.append("  按级别: ").append(stats.getCountByLevel()).append("\n");
-            sb.append("  按类型: ").append(stats.getCountByType()).append("\n");
-            sb.append("  按Tag: ").append(stats.getCountByTag()).append("\n");
-            appendOutput(sb.toString());
-        } catch (Throwable t) {
-            Log.e(TAG, "showStatistics failed", t);
-        }
+        // 数据库统计必须在子线程执行，避免主线程阻塞导致 ANR
+        new Thread(() -> {
+            try {
+                long now = System.currentTimeMillis();
+                long oneDayAgo = now - 86_400_000L;
+                LogStatistics stats = mLogger.statistics(LogQuery.builder()
+                        .fromTime(oneDayAgo)
+                        .toTime(now)
+                        .build());
+                StringBuilder sb = new StringBuilder();
+                sb.append("聚合统计（最近 24h）：\n");
+                sb.append("  总数: ").append(stats.getTotalCount()).append("\n");
+                sb.append("  按级别: ").append(stats.getCountByLevel()).append("\n");
+                sb.append("  按类型: ").append(stats.getCountByType()).append("\n");
+                sb.append("  按Tag: ").append(stats.getCountByTag()).append("\n");
+                runOnUiThread(() -> appendOutput(sb.toString()));
+            } catch (Throwable t) {
+                Log.e(TAG, "showStatistics failed", t);
+                runOnUiThread(() -> appendOutput("统计失败: " + t.getMessage()));
+            }
+        }, "show-statistics").start();
     }
 
     private void queryExceptions() {
-        try {
-            long now = System.currentTimeMillis();
-            long oneHourAgo = now - 3600_000L;
-            List<com.atian10.logrecord.core.model.ExceptionRecord> exceptions =
-                    mLogger.queryExceptions(ExceptionQuery.builder()
-                            .tag(TAG)
-                            .fromTime(oneHourAgo)
-                            .toTime(now)
-                            .orderBy(OrderBy.DESC)
-                            .limit(10)
-                            .build());
-            StringBuilder sb = new StringBuilder();
-            sb.append("查询到 ").append(exceptions.size()).append(" 条异常记录：\n");
-            for (com.atian10.logrecord.core.model.ExceptionRecord e : exceptions) {
-                sb.append("  ").append(e.getExceptionClass())
-                        .append(": ").append(e.getExceptionMessage())
-                        .append("\n");
+        // 数据库查询必须在子线程执行，避免主线程阻塞导致 ANR
+        new Thread(() -> {
+            try {
+                long now = System.currentTimeMillis();
+                long oneHourAgo = now - 3600_000L;
+                List<com.atian10.logrecord.core.model.ExceptionRecord> exceptions =
+                        mLogger.queryExceptions(ExceptionQuery.builder()
+                                .tag(TAG)
+                                .fromTime(oneHourAgo)
+                                .toTime(now)
+                                .orderBy(OrderBy.DESC)
+                                .limit(10)
+                                .build());
+                StringBuilder sb = new StringBuilder();
+                sb.append("查询到 ").append(exceptions.size()).append(" 条异常记录：\n");
+                for (com.atian10.logrecord.core.model.ExceptionRecord e : exceptions) {
+                    sb.append("  ").append(e.getExceptionClass())
+                            .append(": ").append(e.getExceptionMessage())
+                            .append("\n");
+                }
+                runOnUiThread(() -> appendOutput(sb.toString()));
+            } catch (Throwable t) {
+                Log.e(TAG, "queryExceptions failed", t);
+                runOnUiThread(() -> appendOutput("查询异常失败: " + t.getMessage()));
             }
-            appendOutput(sb.toString());
-        } catch (Throwable t) {
-            Log.e(TAG, "queryExceptions failed", t);
-        }
+        }, "query-exceptions").start();
     }
 
     // ===== 导出示例 =====
