@@ -96,17 +96,50 @@ public class LogConfigUpdaterTest {
     }
 
     @Test
-    public void set_replacesEntireConfig() {
+    public void set_replacesDynamicConfig() {
+        // set 仅允许替换动态配置；静态配置（storage/exceptionStorage 等）必须与当前一致
         LogConfigUpdater updater = new LogConfigUpdater(newConfig("v1"));
-        LogConfig replacement = LogConfig.builder()
-                .storage(new FakeStorage())
-                .exceptionStorage(new FakeExceptionStorage())
+        LogConfig current = updater.get();
+        LogConfig replacement = LogConfig.builderFrom(current)
                 .versionTag("replacement")
                 .captureMethodLine(true)
                 .build();
         updater.set(replacement);
         assertEquals("replacement", updater.get().getVersionTag());
         assertTrue(updater.get().isCaptureMethodLine());
+    }
+
+    @Test
+    public void set_storageChanged_throws() {
+        // 静态配置 storage 不允许通过 set 修改，应抛 IllegalArgumentException
+        LogConfigUpdater updater = new LogConfigUpdater(newConfig("v1"));
+        LogConfig replacement = LogConfig.builder()
+                .storage(new FakeStorage())
+                .exceptionStorage(new FakeExceptionStorage())
+                .versionTag("v2")
+                .build();
+        try {
+            updater.set(replacement);
+            fail("changing storage via set() should throw IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // 期望异常
+        }
+    }
+
+    @Test
+    public void set_queueCapacityChanged_throws() {
+        // 静态配置 queueCapacity 不允许通过 set 修改
+        LogConfigUpdater updater = new LogConfigUpdater(newConfig("v1"));
+        LogConfig current = updater.get();
+        LogConfig replacement = LogConfig.builderFrom(current)
+                .queueCapacity(current.getQueueCapacity() + 1024)
+                .build();
+        try {
+            updater.set(replacement);
+            fail("changing queueCapacity via set() should throw IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // 期望异常
+        }
     }
 
     @Test
