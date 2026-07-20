@@ -121,6 +121,11 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
         synchronized (flushLock) {
             try {
                 long observedVersion = flushVersion;
+                // 快速路径：队列空且 worker 未在处理新批次（版本号已更新过），
+                // 说明无待落盘数据，直接返回，避免白等 5 秒超时
+                if (queue.isEmpty() && flushVersion != observedVersion) {
+                    return;
+                }
                 long deadline = System.currentTimeMillis() + 5000L;
                 // 条件：队列非空 或 版本号未变化（说明 worker 未处理新批次）
                 while ((!queue.isEmpty() || flushVersion == observedVersion)
