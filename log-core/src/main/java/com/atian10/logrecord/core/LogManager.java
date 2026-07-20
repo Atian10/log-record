@@ -124,41 +124,42 @@ public final class LogManager implements ILogger {
     }
 
     // ===== ILogger 写入方法 =====
-    // 便捷方法 extraSkip=1（相比 log() 多一层自身栈帧），保证 captureMethodLine 时定位到业务调用者
+    // 便捷方法 extraSkip=0（与 log() 栈帧深度相同，都直接调用 submitLog，无额外栈帧）
+    // 保证 captureMethodLine 时定位到业务调用者本身
 
     @Override
     public void d(String tag, String message) {
-        submitLog(LogLevel.DEBUG, StandardLogType.SYSTEM.code(), tag, message, null, null, 1);
+        submitLog(LogLevel.DEBUG, StandardLogType.SYSTEM.code(), tag, message, null, null, 0);
     }
 
     @Override
     public void i(String tag, String message) {
-        submitLog(LogLevel.INFO, StandardLogType.SYSTEM.code(), tag, message, null, null, 1);
+        submitLog(LogLevel.INFO, StandardLogType.SYSTEM.code(), tag, message, null, null, 0);
     }
 
     @Override
     public void w(String tag, String message) {
-        submitLog(LogLevel.WARN, StandardLogType.SYSTEM.code(), tag, message, null, null, 1);
+        submitLog(LogLevel.WARN, StandardLogType.SYSTEM.code(), tag, message, null, null, 0);
     }
 
     @Override
     public void e(String tag, String message) {
-        submitLog(LogLevel.ERROR, StandardLogType.SYSTEM.code(), tag, message, null, null, 1);
+        submitLog(LogLevel.ERROR, StandardLogType.SYSTEM.code(), tag, message, null, null, 0);
     }
 
     @Override
     public void f(String tag, String message) {
-        submitLog(LogLevel.FATAL, StandardLogType.SYSTEM.code(), tag, message, null, null, 1);
+        submitLog(LogLevel.FATAL, StandardLogType.SYSTEM.code(), tag, message, null, null, 0);
     }
 
     @Override
     public void e(String tag, String message, Throwable throwable) {
-        submitLog(LogLevel.ERROR, StandardLogType.SYSTEM.code(), tag, message, null, throwable, 1);
+        submitLog(LogLevel.ERROR, StandardLogType.SYSTEM.code(), tag, message, null, throwable, 0);
     }
 
     @Override
     public void f(String tag, String message, Throwable throwable) {
-        submitLog(LogLevel.FATAL, StandardLogType.SYSTEM.code(), tag, message, null, throwable, 1);
+        submitLog(LogLevel.FATAL, StandardLogType.SYSTEM.code(), tag, message, null, throwable, 0);
     }
 
     @Override
@@ -225,7 +226,8 @@ public final class LogManager implements ILogger {
 
     /**
      * 提交日志到引擎
-     * @param extraSkip 调用者栈帧额外跳过数（便捷方法 d/i/w/e/f 传 1，log 重载传 0）
+     * @param extraSkip 调用者栈帧额外跳过数（便捷方法 d/i/w/e/f 与 log 重载均传 0，
+     *                  因为二者调用栈帧深度相同：都直接调用本方法）
      */
     private void submitLog(LogLevel level, String type, String tag, String message,
                            Map<String, String> userFields, Throwable throwable,
