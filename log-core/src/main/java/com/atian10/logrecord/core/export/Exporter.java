@@ -14,7 +14,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.util.List;
 
 /**
@@ -76,16 +75,21 @@ public final class Exporter {
         long total = storage.count(query);
         int totalInt = total > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) total;
         int exported = 0;
+        int failed = 0;
 
-        FileOutputStream fos = null;
-        OutputStreamWriter osw = null;
-        BufferedWriter bw = null;
+        File file;
         try {
-            File file = ensureFile(filePath);
-            fos = new FileOutputStream(file, false);
-            osw = new OutputStreamWriter(fos, encoding.getCharset());
-            bw = new BufferedWriter(osw);
+            file = ensureFile(filePath);
+        } catch (Throwable t) {
+            if (callback != null) {
+                callback.onFailure(t, 0);
+            }
+            return 0;
+        }
 
+        try (FileOutputStream fos = new FileOutputStream(file, false);
+             OutputStreamWriter osw = new OutputStreamWriter(fos, encoding.getCharset());
+             BufferedWriter bw = new BufferedWriter(osw)) {
             writeLogHeader(bw, format);
             boolean isFirst = true;
 
@@ -114,10 +118,15 @@ public final class Exporter {
                     break;
                 }
                 for (LogRecord record : page) {
-                    String line = formatter.format(record, format);
-                    writeRecordLine(bw, line, format, isFirst);
-                    isFirst = false;
-                    exported++;
+                    try {
+                        String line = formatter.format(record, format);
+                        writeRecordLine(bw, line, format, isFirst);
+                        isFirst = false;
+                        exported++;
+                    } catch (Throwable t) {
+                        // 单条格式化/写入失败，跳过并计入失败数，不终止整个导出
+                        failed++;
+                    }
                 }
                 if (callback != null) {
                     callback.onProgress(exported, totalInt);
@@ -139,10 +148,6 @@ public final class Exporter {
                 callback.onFailure(t, exported);
             }
             return exported;
-        } finally {
-            closeQuietly(bw);
-            closeQuietly(osw);
-            closeQuietly(fos);
         }
     }
 
@@ -170,16 +175,21 @@ public final class Exporter {
         long total = exceptionStorage.count(query);
         int totalInt = total > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) total;
         int exported = 0;
+        int failed = 0;
 
-        FileOutputStream fos = null;
-        OutputStreamWriter osw = null;
-        BufferedWriter bw = null;
+        File file;
         try {
-            File file = ensureFile(filePath);
-            fos = new FileOutputStream(file, false);
-            osw = new OutputStreamWriter(fos, encoding.getCharset());
-            bw = new BufferedWriter(osw);
+            file = ensureFile(filePath);
+        } catch (Throwable t) {
+            if (callback != null) {
+                callback.onFailure(t, 0);
+            }
+            return 0;
+        }
 
+        try (FileOutputStream fos = new FileOutputStream(file, false);
+             OutputStreamWriter osw = new OutputStreamWriter(fos, encoding.getCharset());
+             BufferedWriter bw = new BufferedWriter(osw)) {
             writeExceptionHeader(bw, format);
             boolean isFirst = true;
 
@@ -200,10 +210,15 @@ public final class Exporter {
                     break;
                 }
                 for (ExceptionRecord record : page) {
-                    String line = formatter.format(record, format);
-                    writeRecordLine(bw, line, format, isFirst);
-                    isFirst = false;
-                    exported++;
+                    try {
+                        String line = formatter.format(record, format);
+                        writeRecordLine(bw, line, format, isFirst);
+                        isFirst = false;
+                        exported++;
+                    } catch (Throwable t) {
+                        // 单条格式化/写入失败，跳过并计入失败数，不终止整个导出
+                        failed++;
+                    }
                 }
                 if (callback != null) {
                     callback.onProgress(exported, totalInt);
@@ -225,10 +240,6 @@ public final class Exporter {
                 callback.onFailure(t, exported);
             }
             return exported;
-        } finally {
-            closeQuietly(bw);
-            closeQuietly(osw);
-            closeQuietly(fos);
         }
     }
 
@@ -302,16 +313,6 @@ public final class Exporter {
         } else {
             bw.write(line);
             bw.write('\n');
-        }
-    }
-
-    private static void closeQuietly(java.io.Closeable c) {
-        if (c != null) {
-            try {
-                c.close();
-            } catch (IOException ignored) {
-                // 忽略关闭异常
-            }
         }
     }
 }

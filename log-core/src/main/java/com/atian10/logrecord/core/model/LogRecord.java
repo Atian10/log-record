@@ -1,6 +1,7 @@
 package com.atian10.logrecord.core.model;
 
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -71,10 +72,10 @@ public final class LogRecord {
         this.versionTag = versionTag;
         this.hasException = hasException;
         this.message = message;
-        // 用户键值对包装为不可变视图
+        // 用户键值对深拷贝后包装为不可变视图，避免调用方修改原 Map 污染内部状态
         this.userFields = userFields == null
                 ? null
-                : Collections.unmodifiableMap(userFields);
+                : Collections.unmodifiableMap(new LinkedHashMap<>(userFields));
     }
 
     public long getTimestamp() {

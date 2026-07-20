@@ -4,7 +4,7 @@ package com.atian10.logrecord.core.engine;
  * 库状态类
  * <p>
  * 描述日志库当前运行状态。不可变对象。
- * 状态分为三档：NORMAL（正常）、DEGRADED（降级）、ERROR（异常）。
+ * 状态分为四档：NORMAL（正常）、DEGRADED（降级）、ERROR（异常）、SHUTDOWN（已关闭）。
  * </p>
  */
 public final class LogStatus {
@@ -17,8 +17,10 @@ public final class LogStatus {
         NORMAL,
         /** 降级运行（如未初始化、数据库初始化失败，降级输出到 System.out） */
         DEGRADED,
-        /** 异常状态（如引擎已关闭） */
-        ERROR
+        /** 异常状态（如工作线程崩溃） */
+        ERROR,
+        /** 已关闭状态（引擎正常 shutdown 后） */
+        SHUTDOWN
     }
 
     private final State state;
@@ -68,6 +70,13 @@ public final class LogStatus {
      */
     public boolean isError() {
         return state == State.ERROR;
+    }
+
+    /**
+     * 是否已关闭状态
+     */
+    public boolean isShutdown() {
+        return state == State.SHUTDOWN;
     }
 
     @Override

@@ -35,12 +35,16 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
     private final LinkedBlockingQueue<LogEntry> queue;
     private final Thread worker;
     private final Object flushLock = new Object();
+    /** submit 与 shutdown 同步锁，保证 check-then-act 原子性 */
+    private final Object stateLock = new Object();
 
     /** 引擎状态相关字段（volatile 保证可见性） */
     private volatile boolean running = true;
     private volatile boolean shutdown = false;
     private final AtomicLong warningCount = new AtomicLong(0);
     private volatile LogStatus status = new LogStatus(LogStatus.State.NORMAL, "init", 0L);
+    /** flush 完成版本号：worker 每完成一轮 batch 自增；flush 据此判断是否真正落盘 */
+    private volatile long flushVersion = 0L;
 
     /**
      * 构造引擎
@@ -88,20 +92,24 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
 
     @Override
     public void submit(LogRecord record) {
-        if (shutdown) {
-            warningCount.incrementAndGet();
-            return;
+        synchronized (stateLock) {
+            if (shutdown) {
+                warningCount.incrementAndGet();
+                return;
+            }
+            offerEntry(LogEntry.of(record));
         }
-        offerEntry(LogEntry.of(record));
     }
 
     @Override
     public void submit(ExceptionRecord record) {
-        if (shutdown) {
-            warningCount.incrementAndGet();
-            return;
+        synchronized (stateLock) {
+            if (shutdown) {
+                warningCount.incrementAndGet();
+                return;
+            }
+            offerEntry(LogEntry.of(record));
         }
-        offerEntry(LogEntry.of(record));
     }
 
     @Override
@@ -109,14 +117,19 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
         if (shutdown) {
             return;
         }
-        // 通过放入哨兵条目并等待工作线程处理实现 flush
-        // 使用 flushLock 同步避免并发 flush 互相唤醒
+        // 等待 worker 完成一轮 batch（flushVersion 变化）且队列为空，确保真正落盘
         synchronized (flushLock) {
             try {
-                // 简单实现：等待队列清空（带超时保护）
+                long observedVersion = flushVersion;
                 long deadline = System.currentTimeMillis() + 5000L;
-                while (!queue.isEmpty() && System.currentTimeMillis() < deadline) {
+                // 条件：队列非空 或 版本号未变化（说明 worker 未处理新批次）
+                while ((!queue.isEmpty() || flushVersion == observedVersion)
+                        && System.currentTimeMillis() < deadline) {
                     flushLock.wait(50);
+                    // 若队列已空且版本号已变化，认为已落盘
+                    if (queue.isEmpty() && flushVersion != observedVersion) {
+                        break;
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -126,11 +139,13 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
 
     @Override
     public void shutdown() {
-        if (shutdown) {
-            return;
+        synchronized (stateLock) {
+            if (shutdown) {
+                return;
+            }
+            shutdown = true;
+            running = false;
         }
-        shutdown = true;
-        running = false;
         // 唤醒工作线程使其检查 shutdown 标志
         worker.interrupt();
         try {
@@ -140,7 +155,7 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
         }
         // 关闭前把队列剩余条目尽量落盘
         drainAndFlushRemaining();
-        status = new LogStatus(LogStatus.State.ERROR, "engine shutdown",
+        status = new LogStatus(LogStatus.State.SHUTDOWN, "engine shutdown",
                 warningCount.get());
     }
 
@@ -220,7 +235,8 @@ public final class AsyncLoggerEngine implements ILoggerEngine {
                     collectEntry(next, logBatch, exceptionBatch);
                 }
                 flushBatches(logBatch, exceptionBatch);
-                // 唤醒可能等待 flush 的线程
+                // 完成一轮 batch，自增 flushVersion 并唤醒可能等待 flush 的线程
+                flushVersion++;
                 synchronized (flushLock) {
                     flushLock.notifyAll();
                 }

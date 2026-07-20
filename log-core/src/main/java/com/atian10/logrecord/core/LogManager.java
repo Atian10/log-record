@@ -56,6 +56,8 @@ public final class LogManager implements ILogger {
     private final Exporter exporter;
     private final CleanTask cleanTask;
     private final IFormatter effectiveFormatter;
+    /** 内部告警最近一条快照（含 storage/clean/export 等），供业务方诊断 */
+    private volatile String lastWarning = null;
 
     /**
      * 初始化日志库
@@ -212,6 +214,10 @@ public final class LogManager implements ILogger {
         } finally {
             cleanTask.shutdown();
             engine.shutdown();
+        }
+        // 重置静态单例，允许业务方重新 init（用于进程内重启日志库场景）
+        synchronized (LogManager.class) {
+            instance = null;
         }
     }
 
@@ -389,11 +395,13 @@ public final class LogManager implements ILogger {
         int cleaned = 0;
         try {
             cleaned += config.getStorage().cleanBefore(timestamp);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            recordInternalWarning("storage.cleanBefore failed", t);
         }
         try {
             cleaned += config.getExceptionStorage().cleanBefore(timestamp);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            recordInternalWarning("exceptionStorage.cleanBefore failed", t);
         }
         return cleaned;
     }
@@ -408,11 +416,13 @@ public final class LogManager implements ILogger {
         int cleaned = 0;
         try {
             cleaned += config.getStorage().cleanByCount(keepCount);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            recordInternalWarning("storage.cleanByCount failed", t);
         }
         try {
             cleaned += config.getExceptionStorage().cleanByCount(keepCount);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            recordInternalWarning("exceptionStorage.cleanByCount failed", t);
         }
         return cleaned;
     }
@@ -441,12 +451,35 @@ public final class LogManager implements ILogger {
     }
 
     /**
+     * 获取内部告警最近一条快照（含 storage/clean/export 等）
+     * <p>业务方可定期检查此方法判断日志库是否健康运行</p>
+     * @return 告警描述，null 表示无告警
+     */
+    public String getLastWarning() {
+        String managerWarning = lastWarning;
+        if (managerWarning != null) {
+            return managerWarning;
+        }
+        // 合并 CleanTask 的最近调度异常
+        return cleanTask.getLastError();
+    }
+
+    /**
+     * 记录内部告警（包级可见，供本模块内部使用）
+     */
+    void recordInternalWarning(String message, Throwable t) {
+        lastWarning = message + ": " + t.getClass().getSimpleName()
+                + ": " + t.getMessage();
+    }
+
+    /**
      * 获取日志总记录数
      */
     public long getLogCount() {
         try {
             return configUpdater.get().getStorage().getRecordCount();
         } catch (Throwable t) {
+            recordInternalWarning("storage.getRecordCount failed", t);
             return -1;
         }
     }
@@ -458,6 +491,7 @@ public final class LogManager implements ILogger {
         try {
             return configUpdater.get().getExceptionStorage().getRecordCount();
         } catch (Throwable t) {
+            recordInternalWarning("exceptionStorage.getRecordCount failed", t);
             return -1;
         }
     }
@@ -469,6 +503,7 @@ public final class LogManager implements ILogger {
         try {
             return configUpdater.get().getStorage().getDbSizeBytes();
         } catch (Throwable t) {
+            recordInternalWarning("storage.getDbSizeBytes failed", t);
             return -1;
         }
     }

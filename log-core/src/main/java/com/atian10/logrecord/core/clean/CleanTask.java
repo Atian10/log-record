@@ -38,6 +38,8 @@ public final class CleanTask {
     /** 当前异常清理策略 */
     private volatile CleanPolicy exceptionCleanPolicy;
     private volatile boolean running = false;
+    /** 最近一次调度清理的异常信息（null 表示无异常），供外部诊断 */
+    private volatile String lastError = null;
 
     /**
      * 构造清理任务
@@ -178,9 +180,21 @@ public final class CleanTask {
             if (expPolicy != null && expPolicy.isEnabled()) {
                 exceptionStorage.clean(expPolicy);
             }
+            // 清理成功，清除上次异常
+            lastError = null;
         } catch (Throwable t) {
-            // 调度任务异常不应中断后续调度
+            // 调度任务异常不应中断后续调度，但记录最近一次异常供外部诊断
+            lastError = "cleanInternal failed: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage();
         }
+    }
+
+    /**
+     * 获取最近一次调度清理的异常信息
+     * @return 异常描述，null 表示无异常
+     */
+    public String getLastError() {
+        return lastError;
     }
 
     /**
