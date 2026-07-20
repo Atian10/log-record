@@ -96,6 +96,30 @@ public interface LogDao {
     List<TagCount> countByTag();
 
     /**
+     * 动态按级别聚合统计（带 WHERE 条件）
+     * @param query SQL 查询（SELECT level, COUNT(*) AS count ... GROUP BY level）
+     * @return 级别计数列表
+     */
+    @RawQuery
+    List<LevelCount> queryLevelCount(SupportSQLiteQuery query);
+
+    /**
+     * 动态按类型聚合统计（带 WHERE 条件）
+     * @param query SQL 查询（SELECT type, COUNT(*) AS count ... GROUP BY type）
+     * @return 类型计数列表
+     */
+    @RawQuery
+    List<TypeCount> queryTypeCount(SupportSQLiteQuery query);
+
+    /**
+     * 动态按标签聚合统计（带 WHERE 条件）
+     * @param query SQL 查询（SELECT tag, COUNT(*) AS count ... GROUP BY tag）
+     * @return 标签计数列表
+     */
+    @RawQuery
+    List<TagCount> queryTagCount(SupportSQLiteQuery query);
+
+    /**
      * 删除全部日志（慎用）
      * @return 删除的记录数
      */

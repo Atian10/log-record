@@ -98,52 +98,62 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public LogStatistics statistics(LogQuery query) {
-        // 全表聚合统计
-        long total = 0;
+        // 复用 count(query) 保证 total 与 WHERE 条件一致；
+        // 三个维度（level/type/tag）通过 buildGroupBySql 拼接 GROUP BY 聚合 SQL，
+        // 复用 appendWhereClause 保证 WHERE 条件与 query 一致。
+        if (query == null) {
+            query = LogQuery.builder().build();
+        }
+        long total = count(query);
+
         Map<LogLevel, Long> byLevel = new HashMap<>();
+        try {
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "level");
+            byLevel = helper.query(sql, args.toArray(), rs -> {
+                Map<LogLevel, Long> m = new HashMap<>();
+                while (rs.next()) {
+                    LogLevel level = LogLevel.fromValue(rs.getInt("level"));
+                    if (level != null) {
+                        m.put(level, rs.getLong("count"));
+                    }
+                }
+                return m;
+            });
+        } catch (SQLException ignored) {
+        }
+
         Map<String, Long> byType = new HashMap<>();
+        try {
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "type");
+            byType = helper.query(sql, args.toArray(), rs -> {
+                Map<String, Long> m = new HashMap<>();
+                while (rs.next()) {
+                    String type = rs.getString("type");
+                    if (type != null) {
+                        m.put(type, rs.getLong("count"));
+                    }
+                }
+                return m;
+            });
+        } catch (SQLException ignored) {
+        }
+
         Map<String, Long> byTag = new HashMap<>();
         try {
-            total = helper.queryLong("SELECT COUNT(*) FROM log_record", null);
-            // 按级别聚合
-            byLevel = helper.query(
-                    "SELECT level, COUNT(*) AS c FROM log_record GROUP BY level", null,
-                    rs -> {
-                        Map<LogLevel, Long> m = new HashMap<>();
-                        while (rs.next()) {
-                            LogLevel level = LogLevel.fromValue(rs.getInt("level"));
-                            if (level != null) {
-                                m.put(level, rs.getLong("c"));
-                            }
-                        }
-                        return m;
-                    });
-            // 按类型聚合
-            byType = helper.query(
-                    "SELECT type, COUNT(*) AS c FROM log_record GROUP BY type", null,
-                    rs -> {
-                        Map<String, Long> m = new HashMap<>();
-                        while (rs.next()) {
-                            String type = rs.getString("type");
-                            if (type != null) {
-                                m.put(type, rs.getLong("c"));
-                            }
-                        }
-                        return m;
-                    });
-            // 按标签聚合
-            byTag = helper.query(
-                    "SELECT tag, COUNT(*) AS c FROM log_record GROUP BY tag", null,
-                    rs -> {
-                        Map<String, Long> m = new HashMap<>();
-                        while (rs.next()) {
-                            String tag = rs.getString("tag");
-                            if (tag != null) {
-                                m.put(tag, rs.getLong("c"));
-                            }
-                        }
-                        return m;
-                    });
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "tag");
+            byTag = helper.query(sql, args.toArray(), rs -> {
+                Map<String, Long> m = new HashMap<>();
+                while (rs.next()) {
+                    String tag = rs.getString("tag");
+                    if (tag != null) {
+                        m.put(tag, rs.getLong("count"));
+                    }
+                }
+                return m;
+            });
         } catch (SQLException ignored) {
         }
         return new LogStatistics(total, byLevel, byType, byTag);
@@ -314,6 +324,44 @@ public final class JdbcStorage implements IStorage {
         } else {
             sql.append("SELECT * FROM log_record");
         }
+        appendWhereClause(sql, args, query);
+        if (!countMode) {
+            sql.append(" ORDER BY timestamp ");
+            sql.append(query.getOrderBy() == OrderBy.ASC ? "ASC" : "DESC");
+            if (query.getLimit() > 0) {
+                sql.append(" LIMIT ? OFFSET ?");
+                args.add(query.getLimit());
+                args.add(query.getOffset());
+            }
+        }
+        return sql.toString();
+    }
+
+    /**
+     * 构建 GROUP BY 聚合查询 SQL
+     * <p>用于 statistics 方法，按指定列分组聚合并附加 WHERE 条件</p>
+     * @param query 查询条件（用于 WHERE 子句）
+     * @param args  参数列表（输出）
+     * @param groupByColumn 分组列名（如 "level"/"type"/"tag"）
+     * @return SQL 字符串，形如 SELECT {col}, COUNT(*) AS count FROM log_record WHERE ... GROUP BY {col}
+     */
+    private String buildGroupBySql(LogQuery query, List<Object> args, String groupByColumn) {
+        StringBuilder sql = new StringBuilder(128);
+        sql.append("SELECT ").append(groupByColumn)
+                .append(", COUNT(*) AS count FROM log_record");
+        appendWhereClause(sql, args, query);
+        sql.append(" GROUP BY ").append(groupByColumn);
+        return sql.toString();
+    }
+
+    /**
+     * 追加 WHERE 子句到 SQL 构造器
+     * <p>抽取公共 WHERE 拼接逻辑，供 buildQuerySql 和 buildGroupBySql 复用</p>
+     * @param sql SQL 构造器
+     * @param args 参数列表（输出）
+     * @param query 查询条件
+     */
+    private void appendWhereClause(StringBuilder sql, List<Object> args, LogQuery query) {
         boolean hasWhere = false;
         if (query.getLevel() != null) {
             sql.append(hasWhere ? " AND " : " WHERE ").append("level = ?");
@@ -359,15 +407,5 @@ public final class JdbcStorage implements IStorage {
                 hasWhere = true;
             }
         }
-        if (!countMode) {
-            sql.append(" ORDER BY timestamp ");
-            sql.append(query.getOrderBy() == OrderBy.ASC ? "ASC" : "DESC");
-            if (query.getLimit() > 0) {
-                sql.append(" LIMIT ? OFFSET ?");
-                args.add(query.getLimit());
-                args.add(query.getOffset());
-            }
-        }
-        return sql.toString();
     }
 }

@@ -93,26 +93,54 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public LogStatistics statistics(LogQuery query) {
-        // 使用全表聚合（条件过滤由业务方通过 query 后自行统计，
-        // 此处提供全表统计以保证性能；如需条件统计可扩展 buildQuerySql 支持 GROUP BY）
-        long total = dao.countAll();
+        // 复用 count(query) 保证 total 与 WHERE 条件一致；
+        // 三个维度（level/type/tag）通过 buildGroupBySql 拼接 GROUP BY 聚合 SQL，
+        // 复用 appendWhereClause 保证 WHERE 条件与 query 一致。
+        if (query == null) {
+            query = LogQuery.builder().build();
+        }
+        long total = count(query);
+
         Map<LogLevel, Long> byLevel = new HashMap<>();
-        for (LogDao.LevelCount lc : dao.countByLevel()) {
-            LogLevel level = LogLevel.fromValue(lc.level);
-            if (level != null) {
-                byLevel.put(level, lc.count);
+        {
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "level");
+            List<LogDao.LevelCount> list = dao.queryLevelCount(new SimpleSQLiteQuery(sql, args.toArray()));
+            if (list != null) {
+                for (LogDao.LevelCount lc : list) {
+                    LogLevel level = LogLevel.fromValue(lc.level);
+                    if (level != null) {
+                        byLevel.put(level, lc.count);
+                    }
+                }
             }
         }
+
         Map<String, Long> byType = new HashMap<>();
-        for (LogDao.TypeCount tc : dao.countByType()) {
-            if (tc.type != null) {
-                byType.put(tc.type, tc.count);
+        {
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "type");
+            List<LogDao.TypeCount> list = dao.queryTypeCount(new SimpleSQLiteQuery(sql, args.toArray()));
+            if (list != null) {
+                for (LogDao.TypeCount tc : list) {
+                    if (tc.type != null) {
+                        byType.put(tc.type, tc.count);
+                    }
+                }
             }
         }
+
         Map<String, Long> byTag = new HashMap<>();
-        for (LogDao.TagCount tc : dao.countByTag()) {
-            if (tc.tag != null) {
-                byTag.put(tc.tag, tc.count);
+        {
+            List<Object> args = new ArrayList<>();
+            String sql = buildGroupBySql(query, args, "tag");
+            List<LogDao.TagCount> list = dao.queryTagCount(new SimpleSQLiteQuery(sql, args.toArray()));
+            if (list != null) {
+                for (LogDao.TagCount tc : list) {
+                    if (tc.tag != null) {
+                        byTag.put(tc.tag, tc.count);
+                    }
+                }
             }
         }
         return new LogStatistics(total, byLevel, byType, byTag);
@@ -130,19 +158,13 @@ public final class RoomStorage implements IStorage {
                     - (long) policy.getKeepDays() * 24L * 60L * 60L * 1000L;
             cleaned += dao.cleanBefore(threshold);
         }
-        // 按容量清理（超过上限时按天数清理；未配 keepDays 则按数量清理）
+        // 按容量清理（超限时按数量保留当前的一半，避免重复 cleanBefore 无效调用）
         long maxSizeBytes = policy.getMaxDbSizeMB() * 1024L * 1024L;
         if (maxSizeBytes > 0 && getDbSizeBytes() > maxSizeBytes) {
-            if (policy.getKeepDays() > 0) {
-                // 已按天数清理过，再清理一次更旧的
-                long threshold = System.currentTimeMillis()
-                        - (long) policy.getKeepDays() * 24L * 60L * 60L * 1000L;
-                cleaned += dao.cleanBefore(threshold);
-            } else {
-                // 未配天数，按数量保留当前的一半
-                long currentCount = dao.countAll();
-                cleaned += dao.cleanByCount((int) Math.max(1, currentCount / 2));
-            }
+            // 容量超限：统一按数量保留当前的一半（不论是否配置 keepDays）
+            // 原实现按 keepDays 再次 cleanBefore 相同 threshold 必返回 0，逻辑无效
+            long currentCount = dao.countAll();
+            cleaned += dao.cleanByCount((int) Math.max(1, currentCount / 2));
         }
         // 按数量清理
         if (policy.getMaxRecordCount() > 0 && dao.countAll() > policy.getMaxRecordCount()) {
@@ -208,6 +230,44 @@ public final class RoomStorage implements IStorage {
         } else {
             sql.append("SELECT * FROM log_record");
         }
+        appendWhereClause(sql, args, query);
+        if (!countMode) {
+            sql.append(" ORDER BY timestamp ");
+            sql.append(query.getOrderBy() == OrderBy.ASC ? "ASC" : "DESC");
+            if (query.getLimit() > 0) {
+                sql.append(" LIMIT ? OFFSET ?");
+                args.add(query.getLimit());
+                args.add(query.getOffset());
+            }
+        }
+        return sql.toString();
+    }
+
+    /**
+     * 构建 GROUP BY 聚合查询 SQL
+     * <p>用于 statistics 方法，按指定列分组聚合并附加 WHERE 条件</p>
+     * @param query 查询条件（用于 WHERE 子句）
+     * @param args  参数列表（输出）
+     * @param groupByColumn 分组列名（如 "level"/"type"/"tag"）
+     * @return SQL 字符串，形如 SELECT {col}, COUNT(*) AS count FROM log_record WHERE ... GROUP BY {col}
+     */
+    private String buildGroupBySql(LogQuery query, List<Object> args, String groupByColumn) {
+        StringBuilder sql = new StringBuilder(128);
+        sql.append("SELECT ").append(groupByColumn)
+                .append(", COUNT(*) AS count FROM log_record");
+        appendWhereClause(sql, args, query);
+        sql.append(" GROUP BY ").append(groupByColumn);
+        return sql.toString();
+    }
+
+    /**
+     * 追加 WHERE 子句到 SQL 构造器
+     * <p>抽取公共 WHERE 拼接逻辑，供 buildQuerySql 和 buildGroupBySql 复用</p>
+     * @param sql SQL 构造器
+     * @param args 参数列表（输出）
+     * @param query 查询条件
+     */
+    private void appendWhereClause(StringBuilder sql, List<Object> args, LogQuery query) {
         boolean hasWhere = false;
         if (query.getLevel() != null) {
             sql.append(hasWhere ? " AND " : " WHERE ").append("level = ?");
@@ -254,15 +314,5 @@ public final class RoomStorage implements IStorage {
                 hasWhere = true;
             }
         }
-        if (!countMode) {
-            sql.append(" ORDER BY timestamp ");
-            sql.append(query.getOrderBy() == OrderBy.ASC ? "ASC" : "DESC");
-            if (query.getLimit() > 0) {
-                sql.append(" LIMIT ? OFFSET ?");
-                args.add(query.getLimit());
-                args.add(query.getOffset());
-            }
-        }
-        return sql.toString();
     }
 }
