@@ -20,6 +20,14 @@ android {
         targetCompatibility JavaVersion.VERSION_1_8
     }
 
+    // release 构建开启混淆，验证 consumer-rules.pro 传递是否完备
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
     // 纯代码示例，关闭非必要构建特性
     buildFeatures {
         buildConfig false
@@ -32,4 +40,13 @@ dependencies {
     implementation project(':log-android')
     // 显式声明 log-core 依赖（log-android 已通过 api 传递，显式声明提高依赖透明度）
     implementation project(':log-core')
+
+    // 统一 Kotlin stdlib 版本，避免 Room 2.5.2 传递的 1.8.0 与 AndroidX 传递的 1.7.20 冲突
+    configurations.all {
+        resolutionStrategy {
+            force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.0'
+            force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.0'
+            force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.0'
+        }
+    }
 }
