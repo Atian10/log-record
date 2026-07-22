@@ -2,6 +2,9 @@ package com.atian10.logrecord.android;
 
 import androidx.sqlite.db.SimpleSQLiteQuery;
 
+import android.os.Looper;
+import android.util.Log;
+
 import com.atian10.logrecord.core.IExceptionStorage;
 import com.atian10.logrecord.core.config.CleanPolicy;
 import com.atian10.logrecord.core.model.ExceptionRecord;
@@ -68,6 +71,7 @@ public final class RoomExceptionStorage implements IExceptionStorage {
 
     @Override
     public List<ExceptionRecord> query(ExceptionQuery query) {
+        warnIfMainThread("queryExceptions");
         if (query == null) {
             return new ArrayList<>();
         }
@@ -144,6 +148,7 @@ public final class RoomExceptionStorage implements IExceptionStorage {
 
     @Override
     public long count(ExceptionQuery query) {
+        warnIfMainThread("countExceptions");
         if (query == null) {
             return dao.countAll();
         }
@@ -198,5 +203,18 @@ public final class RoomExceptionStorage implements IExceptionStorage {
             }
         }
         return sql.toString();
+    }
+
+    /**
+     * 检测当前是否运行在 Android 主线程，如果是则输出警告日志
+     * <p>数据库查询不应在主线程执行，否则会导致 ANR</p>
+     * @param operation 当前操作名称（如 "queryExceptions"/"countExceptions"）
+     */
+    private void warnIfMainThread(String operation) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w("RoomExceptionStorage", "⚠️ " + operation
+                    + "() called on main thread! Database operations on main thread may cause ANR."
+                    + " Please move to a background thread.");
+        }
     }
 }

@@ -2,6 +2,9 @@ package com.atian10.logrecord.android;
 
 import androidx.sqlite.db.SimpleSQLiteQuery;
 
+import android.os.Looper;
+import android.util.Log;
+
 import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.config.CleanPolicy;
 import com.atian10.logrecord.core.model.LogLevel;
@@ -73,6 +76,7 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public List<LogRecord> query(LogQuery query) {
+        warnIfMainThread("query");
         if (query == null) {
             return new ArrayList<>();
         }
@@ -93,6 +97,7 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public LogStatistics statistics(LogQuery query) {
+        warnIfMainThread("statistics");
         // 复用 count(query) 保证 total 与 WHERE 条件一致；
         // 三个维度（level/type/tag）通过 buildGroupBySql 拼接 GROUP BY 聚合 SQL，
         // 复用 appendWhereClause 保证 WHERE 条件与 query 一致。
@@ -208,6 +213,7 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public long count(LogQuery query) {
+        warnIfMainThread("count");
         if (query == null) {
             return dao.countAll();
         }
@@ -313,6 +319,19 @@ public final class RoomStorage implements IStorage {
                         + "\":\"" + LikeEscapeUtil.escape(e.getValue()) + "\"%");
                 hasWhere = true;
             }
+        }
+    }
+
+    /**
+     * 检测当前是否运行在 Android 主线程，如果是则输出警告日志
+     * <p>数据库查询/统计不应在主线程执行，否则会导致 ANR</p>
+     * @param operation 当前操作名称（如 "query"/"statistics"/"count"）
+     */
+    private void warnIfMainThread(String operation) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w("RoomStorage", "⚠️ " + operation
+                    + "() called on main thread! Database operations on main thread may cause ANR."
+                    + " Please move to a background thread.");
         }
     }
 }
