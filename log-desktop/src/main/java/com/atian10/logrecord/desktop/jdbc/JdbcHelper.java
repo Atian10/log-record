@@ -77,15 +77,30 @@ public final class JdbcHelper {
 
     /**
      * 批量插入（事务）
+     * <p>
+     * 事务失败时先执行回滚以确认事务终态：
+     * <ul>
+     *   <li>回滚成功：抛 {@link BatchRolledBackException}，表示数据确定未提交、可安全重放</li>
+     *   <li>回滚失败或提交阶段失败后无法确认：抛原始 {@link SQLException}，
+     *       表示事务结果不确定，调用方禁止自动重放</li>
+     * </ul>
+     * 回滚失败与恢复 autoCommit 状态的失败均以 suppressed 证据附加在最终异常上，
+     * 不再静默吞掉。
+     * </p>
      * @param sql INSERT 语句
      * @param batchArgs 批量参数（每行一组参数）
      * @return 插入总行数
-     * @throws SQLException 执行失败
+     * @throws SQLException 执行失败；具体含义见上述事务终态规则
      */
     public synchronized int executeBatch(String sql, Object[][] batchArgs) throws SQLException {
         ensureOpen();
         boolean originalAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
+        // 批量失败原因（null 表示成功）；回滚与状态恢复失败作为 suppressed 证据附加其上
+        SQLException failure = null;
+        // 事务是否已通过 rollback 确认清理
+        boolean rolledBackCleanly = false;
+        int total = 0;
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             if (batchArgs != null) {
                 for (Object[] args : batchArgs) {
@@ -99,25 +114,43 @@ public final class JdbcHelper {
             }
             int[] counts = ps.executeBatch();
             connection.commit();
-            int total = 0;
+            total = 0;
             for (int c : counts) {
                 if (c > 0) {
                     total += c;
                 }
             }
-            return total;
         } catch (SQLException e) {
+            failure = e;
             try {
                 connection.rollback();
-            } catch (SQLException ignored) {
+                rolledBackCleanly = true;
+            } catch (SQLException rb) {
+                // 回滚失败：事务终态不确定，保留证据并禁止调用方重放
+                e.addSuppressed(rb);
             }
-            throw e;
         } finally {
             try {
                 connection.setAutoCommit(originalAutoCommit);
-            } catch (SQLException ignored) {
+            } catch (SQLException restore) {
+                if (failure != null) {
+                    // 已有失败在途：恢复失败仅作为证据附加
+                    failure.addSuppressed(restore);
+                } else {
+                    // 提交已成功但连接状态恢复失败：如实抛出，避免静默遗留手动事务状态
+                    failure = new SQLException(
+                            "restore autoCommit failed after successful commit", restore);
+                }
             }
         }
+        if (failure != null) {
+            if (rolledBackCleanly) {
+                throw new BatchRolledBackException(
+                        "batch transaction rolled back cleanly, safe to replay", failure);
+            }
+            throw failure;
+        }
+        return total;
     }
 
     /**
@@ -207,7 +240,7 @@ public final class JdbcHelper {
     }
 
     /**
-     * 获取数据库文件大小（字节）
+     * 获取数据库文件大小（字节，仅主文件）
      */
     public synchronized long getDbSizeBytes() {
         if (dbPath == null) {
@@ -221,6 +254,31 @@ public final class JdbcHelper {
         } catch (Throwable ignored) {
         }
         return 0L;
+    }
+
+    /**
+     * 获取数据库相关文件当前长度之和（字节）
+     * <p>容量预算的度量口径：主数据库、存在的 -wal、-shm 以及存在的回滚日志
+     * (-journal) 文件。它是可移植的文件长度口径，不宣称等于文件系统分配簇占用</p>
+     */
+    public synchronized long getDbTotalSizeBytes() {
+        if (dbPath == null) {
+            return 0L;
+        }
+        long total = 0L;
+        // 主文件 + WAL/共享内存/回滚日志相关文件
+        String[] suffixes = {"", "-wal", "-shm", "-journal"};
+        for (String suffix : suffixes) {
+            try {
+                java.io.File f = new java.io.File(dbPath + suffix);
+                if (f.exists()) {
+                    total += f.length();
+                }
+            } catch (Throwable ignored) {
+                // 单个文件不可读不影响其余度量
+            }
+        }
+        return total;
     }
 
     // ===== 内部方法 =====

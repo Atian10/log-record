@@ -8,10 +8,10 @@
 - 自定义日志类型（预设 + 无限扩展）
 - 数据库持久化存储（Android Room / JDBC SQLite）
 - 按条件查询、聚合统计、分页排序
-- 日志导出（TXT / JSON / CSV，编码可选）
-- 自动清理（按天数/容量/数量，可配置）
-- 异步写入引擎（单线程 + 批处理）
-- 运行时动态修改配置
+- 日志导出（TXT / JSON / CSV，编码可选；一致性快照边界 + 统一失败契约 + 原子发布）
+- 自动清理（表级按天数/数量 + 全库磁盘容量预算 `databaseMaxSizeMB`，旧容量参数自动迁移）
+- 异步写入引擎（单线程 + 批处理；flush/shutdown 带超时结果 `FlushResult`/`ShutdownResult`）
+- 运行时动态修改配置（含 formatter，导出按次生效）
 - 异常独立存储与查询
 
 ## 模块说明
@@ -126,12 +126,14 @@ new Thread(() -> {
             .build());
 }).start();
 
-// 4. 导出日志
-LogManager.get().exportLogs(
-    LogQuery.builder().build(),
-    ExportFormat.JSON,
-    outputPath,
-    callback);
+// 4. 导出日志（含数据库与文件 IO，必须在子线程！）
+//    cleanNow / flush(long) / shutdown(long) 同样为阻塞或数据库操作，勿在主线程调用
+backgroundExecutor.execute(() ->
+    LogManager.get().exportLogs(
+        LogQuery.builder().build(),
+        ExportFormat.JSON,
+        outputPath,
+        callback));
 ```
 
 ### 桌面/服务器

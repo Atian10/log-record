@@ -6,7 +6,9 @@ import com.atian10.logrecord.core.config.CleanPolicy;
 import com.atian10.logrecord.core.config.LogConfig;
 import com.atian10.logrecord.core.config.LogConfigUpdater;
 import com.atian10.logrecord.core.engine.AsyncLoggerEngine;
+import com.atian10.logrecord.core.engine.FlushResult;
 import com.atian10.logrecord.core.engine.LogStatus;
+import com.atian10.logrecord.core.engine.ShutdownResult;
 import com.atian10.logrecord.core.export.ExportCallback;
 import com.atian10.logrecord.core.export.ExportEncoding;
 import com.atian10.logrecord.core.export.ExportFormat;
@@ -25,6 +27,7 @@ import com.atian10.logrecord.core.util.TimeUtil;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 日志库全局门面
@@ -49,15 +52,37 @@ public final class LogManager implements ILogger {
     // captureCaller 自身占 1 帧，buildLogRecord 占 1 帧，LogManager.x 占 1 帧
     private static final int SKIP_FRAMES_FROM_BUILD = 3;
 
+    /** 关闭流程各阶段的默认等待时限（毫秒） */
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 5000L;
+
+    /** 全局单例实例 */
     private static volatile LogManager instance;
+
+    /**
+     * 实例生命周期
+     * <p>区分于 {@link LogStatus} 的健康状态；仅由本实例的关闭流程推进</p>
+     */
+    private enum Lifecycle {
+        /** 运行中 */
+        RUNNING,
+        /** 关闭中（停止接收、停止清理、等待排空） */
+        CLOSING,
+        /** 已关闭 */
+        CLOSED
+    }
 
     private final LogConfigUpdater configUpdater;
     private final AsyncLoggerEngine engine;
     private final Exporter exporter;
     private final CleanTask cleanTask;
+    /** 缺省格式化器（初始化时确定，未配置 formatter 时为 DefaultFormatter）；当前生效值经 {@link #currentFormatter} 读取 */
     private final IFormatter effectiveFormatter;
     /** 内部告警最近一条快照（含 storage/clean/export 等），供业务方诊断 */
     private volatile String lastWarning = null;
+    /** 实例生命周期状态 */
+    private volatile Lifecycle lifecycle = Lifecycle.RUNNING;
+    /** 最近一次关闭结果（shutdown(long) 内同步保护），重复关闭时直接返回 */
+    private ShutdownResult lastShutdownResult = null;
 
     /**
      * 初始化日志库
@@ -105,6 +130,8 @@ public final class LogManager implements ILogger {
             throw new NullPointerException("config == null");
         }
         this.configUpdater = new LogConfigUpdater(config);
+        // 缺省格式化器：初始化时配置的 formatter，未配置时使用 DefaultFormatter；
+        // 运行时更新 formatter 只影响导出与控制台输出（每次使用时读取当前配置）
         this.effectiveFormatter = config.getFormatter() != null
                 ? config.getFormatter() : new DefaultFormatter();
         this.engine = new AsyncLoggerEngine(
@@ -118,7 +145,10 @@ public final class LogManager implements ILogger {
                 config.getStorage(),
                 config.getExceptionStorage(),
                 effectiveFormatter);
-        this.cleanTask = new CleanTask(config.getStorage(), config.getExceptionStorage());
+        // 清理任务注入容量协调器与预算供应者（B4：表级规则之后执行全库容量阶段）
+        this.cleanTask = new CleanTask(config.getStorage(), config.getExceptionStorage(),
+                config.getCapacityCoordinator(),
+                () -> com.atian10.logrecord.core.config.CapacityBudgets.resolve(configUpdater.get()));
         // 启动定时清理
         cleanTask.start(config.getCleanPolicy(), config.getExceptionCleanPolicy());
     }
@@ -208,18 +238,82 @@ public final class LogManager implements ILogger {
         engine.flush();
     }
 
+    /**
+     * 带超时的立即落盘
+     * <p>语义见 {@link AsyncLoggerEngine#flush(long)}：只等待调用时刻已接收记录全部终态</p>
+     * @param timeoutMillis 等待时限（毫秒），负数按 0 处理
+     * @return 等待结果
+     */
+    public FlushResult flush(long timeoutMillis) {
+        return engine.flush(timeoutMillis);
+    }
+
     @Override
-    public void shutdown() {
-        try {
-            engine.flush();
-        } finally {
-            cleanTask.shutdown();
-            engine.shutdown();
+    public synchronized void shutdown() {
+        shutdown(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * 带超时关闭日志库
+     * <p>
+     * 顺序：停止接收新记录 → 停止清理调度并等待清理线程退出 → 等待引擎工作线程
+     * 完成排空并退出。队列排空由唯一工作线程负责，调用线程不执行兜底写入。
+     * 关闭幂等：已关闭时直接返回上次结果；并发调用会串行化后返回同一结果。
+     * </p>
+     * <p>
+     * 超时返回 {@link ShutdownResult.Outcome#TIMEOUT} 时，工作线程仍在后台排空；
+     * 本实例的静态引用仍会被清除以允许重新初始化（新实例不接管本实例资源），
+     * 底层数据库资源的释放应由资源所有者等待 {@link #isTerminated()} 为 true 后进行。
+     * </p>
+     * @param timeoutMillis 各阶段共享的等待时限（毫秒），负数按 0 处理
+     * @return 关闭结果
+     */
+    public synchronized ShutdownResult shutdown(long timeoutMillis) {
+        if (lifecycle == Lifecycle.CLOSED) {
+            // 幂等：重复关闭返回上次结果，不再触碰任何资源或静态引用
+            return lastShutdownResult != null ? lastShutdownResult
+                    : ShutdownResult.completed(0L, true);
         }
-        // 重置静态单例，允许业务方重新 init（用于进程内重启日志库场景）
+        lifecycle = Lifecycle.CLOSING;
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
+        // 1. 停止接收新记录并唤醒引擎工作线程
+        engine.stopAccepting();
+        // 2. 停止清理调度并等待清理线程退出（先于排空等待，避免清理与排空竞争存储）
+        boolean cleanerTerminated = cleanTask.shutdown(remainingMillis(deadlineNanos));
+        // 3. 等待工作线程完成排空并退出
+        ShutdownResult engineResult = engine.awaitShutdown(remainingMillis(deadlineNanos));
+        lifecycle = Lifecycle.CLOSED;
+        lastShutdownResult = engineResult.getOutcome() == ShutdownResult.Outcome.COMPLETED
+                ? ShutdownResult.completed(engineResult.getPendingCount(), cleanerTerminated)
+                : ShutdownResult.timeout(engineResult.getPendingCount(), cleanerTerminated);
+        // 仅当静态引用仍指向本实例时清除，避免旧实例关闭清掉新实例（ISSUE-09）；
+        // 清除后允许业务方重新 init
         synchronized (LogManager.class) {
-            instance = null;
+            if (instance == this) {
+                instance = null;
+            }
         }
+        return lastShutdownResult;
+    }
+
+    /**
+     * 计算距截止时刻的剩余毫秒数（不足 1 毫秒按 0 处理）
+     */
+    private static long remainingMillis(long deadlineNanos) {
+        return Math.max(0L,
+                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+    }
+
+    /**
+     * 关闭流程是否已完全结束
+     * <p>生命周期已到 CLOSED 且引擎工作线程与清理线程均已退出；
+     * 为 true 时释放底层数据库资源才不会中断在途操作</p>
+     */
+    public boolean isTerminated() {
+        return lifecycle == Lifecycle.CLOSED
+                && engine.isTerminated()
+                && cleanTask.isTerminated();
     }
 
     // ===== 内部写入逻辑 =====
@@ -299,8 +393,8 @@ public final class LogManager implements ILogger {
     }
 
     private String formatForConsole(LogRecord record) {
-        // 控制台用 DefaultFormatter 的 TXT 格式
-        return effectiveFormatter.format(record, ExportFormat.TXT);
+        // 控制台输出与导出一致使用当前配置的格式化器（未配置时用缺省）
+        return currentFormatter(configUpdater.get()).format(record, ExportFormat.TXT);
     }
 
     // ===== 查询方法 =====
@@ -354,24 +448,34 @@ public final class LogManager implements ILogger {
 
     /**
      * 导出日志到文件
+     * <p>导出开始时从当前配置捕获 formatter 与编码，本次导出全程使用同一快照；
+     * 中途更新配置只影响下一次导出（ISSUE-08）</p>
      * @return 导出条数
      */
     public int exportLogs(LogQuery query, ExportFormat format, String filePath,
                           ExportCallback callback) {
         LogConfig config = configUpdater.get();
         return exporter.exportLogs(query, format, config.getExportEncoding(),
-                filePath, callback);
+                currentFormatter(config), filePath, callback);
     }
 
     /**
      * 导出异常到文件
+     * <p>导出开始时从当前配置捕获 formatter 与编码，本次导出全程使用同一快照</p>
      * @return 导出条数
      */
     public int exportExceptions(ExceptionQuery query, ExportFormat format, String filePath,
                                 ExportCallback callback) {
         LogConfig config = configUpdater.get();
         return exporter.exportExceptions(query, format, config.getExportEncoding(),
-                filePath, callback);
+                currentFormatter(config), filePath, callback);
+    }
+
+    /**
+     * 读取当前生效的格式化器：配置了 formatter 用配置值，否则用缺省（DefaultFormatter）
+     */
+    private IFormatter currentFormatter(LogConfig config) {
+        return config.getFormatter() != null ? config.getFormatter() : effectiveFormatter;
     }
 
     // ===== 清理方法 =====
@@ -511,10 +615,12 @@ public final class LogManager implements ILogger {
     }
 
     /**
-     * 获取格式化器
+     * 获取当前生效的格式化器
+     * <p>运行时通过配置更新器修改 formatter 后，本方法与后续导出均使用新值；
+     * 未配置 formatter 时返回初始化时确定的缺省（DefaultFormatter）</p>
      */
     public IFormatter getFormatter() {
-        return effectiveFormatter;
+        return currentFormatter(configUpdater.get());
     }
 
     /**

@@ -19,12 +19,21 @@ public interface IStorage {
 
     /**
      * 写入单条日志
+     * <p>
+     * 写入失败时应抛出异常（推荐 {@link BatchWriteException} 携带已保存数量），
+     * 由异步引擎统一容错计数；不应静默吞掉失败。
+     * </p>
      * @param record 日志记录
      */
     void write(LogRecord record);
 
     /**
      * 批量写入日志（异步引擎攒批后调用）
+     * <p>
+     * 写入失败时应抛出异常（推荐 {@link BatchWriteException} 携带已保存数量）。
+     * 批量降级重试由存储实现自行决定并在内部完成后上报最终数量；
+     * 提交结果不确定的事务禁止自动重放，避免重复写入。
+     * </p>
      * @param records 日志记录列表
      */
     void writeBatch(List<LogRecord> records);
@@ -82,4 +91,27 @@ public interface IStorage {
      * @return 记录数
      */
     long count(LogQuery query);
+
+    /**
+     * 打开日志表的一致性导出快照
+     * <p>
+     * 打开时捕获目标表已提交的最大 ID 边界与匹配数量；读取期间按
+     * {@code (timestamp, id)} 双键稳定次序分批返回，边界外新增不进入快照，
+     * 目标表清理被互斥推迟。导出必须使用本能力保证集合一致性。
+     * </p>
+     * <p>
+     * 默认实现明确报告不支持（{@link UnsupportedOperationException}）：
+     * 自定义存储若要继续支持导出，需实现本方法提供快照适配；
+     * 导出器不会静默回退到不可靠的 OFFSET 分页。
+     * </p>
+     *
+     * @param query 查询条件（分页参数被忽略，排序由快照固定）
+     * @return 导出快照；使用方负责 {@link IExportSnapshot#close()}
+     * @throws UnsupportedOperationException 存储未提供快照适配
+     * @throws ExportSnapshotException 边界捕获失败
+     */
+    default IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+        throw new UnsupportedOperationException(
+                "storage does not implement openExportSnapshot; adapt it to keep export available");
+    }
 }

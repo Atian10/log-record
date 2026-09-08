@@ -53,6 +53,30 @@ public final class JsonUtil {
     }
 
     /**
+     * 构造单个键值对的规范 JSON 成员片段（不含外层大括号）
+     * <p>
+     * 用于 userFields 查询条件：与 {@link #mapToJson} 使用同一 Gson 配置序列化
+     * 单项键值，取出形如 {@code "key":"value"} 的成员片段（value 为 null 时为
+     * {@code "key":null}）。存储层用该片段做参数化子串匹配（如 SQLite instr），
+     * 保证大小写敏感，并正确处理引号、反斜杠、换行等 JSON 转义，与写入表示一致。
+     * </p>
+     * <p>适用范围限定为本库统一配置生成的字符串映射 JSON；外部导入的非规范
+     * JSON 或其他值类型不经额外验证不承诺匹配。</p>
+     *
+     * @param key 字段名，不可为 null
+     * @param value 字段值，可为 null（null 表示查询"值为 null"的精确匹配）
+     * @return 规范成员片段，形如 {@code "key":"value"} 或 {@code "key":null}
+     */
+    public static String userFieldMemberJson(String key, String value) {
+        if (key == null) {
+            throw new NullPointerException("key == null");
+        }
+        // 序列化单条目 Map 后去掉首尾大括号，得到与写入路径一致的成员表示
+        String json = GSON.toJson(Collections.singletonMap(key, value));
+        return json.substring(1, json.length() - 1);
+    }
+
+    /**
      * 将 JSON 字符串反序列化为 Map<String,String>
      * @param json JSON 字符串
      * @return 不可变 Map；json 为空或解析失败时返回空 Map

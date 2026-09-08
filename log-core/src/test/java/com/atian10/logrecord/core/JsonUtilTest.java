@@ -4,10 +4,12 @@ import com.atian10.logrecord.core.util.JsonUtil;
 
 import org.junit.Test;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -109,5 +111,49 @@ public class JsonUtilTest {
     @Test
     public void toJson_null_returnsNullLiteral() {
         assertEquals("null", JsonUtil.toJson(null));
+    }
+
+    // ===== userFieldMemberJson（T-03 / ISSUE-07）=====
+
+    @Test
+    public void userFieldMemberJson_normal_returnsQuotedMember() {
+        assertEquals("\"k\":\"v\"", JsonUtil.userFieldMemberJson("k", "v"));
+    }
+
+    @Test
+    public void userFieldMemberJson_nullValue_returnsNullLiteral() {
+        assertEquals("\"k\":null", JsonUtil.userFieldMemberJson("k", null));
+    }
+
+    @Test
+    public void userFieldMemberJson_emptyValue_returnsEmptyStringMember() {
+        assertEquals("\"k\":\"\"", JsonUtil.userFieldMemberJson("k", ""));
+    }
+
+    @Test
+    public void userFieldMemberJson_specialChars_matchesWriteEncoding() {
+        // 键值含引号/反斜杠/换行时，成员片段必须与写入 mapToJson 的转义表示一致
+        String key = "k\"ey\\x";
+        String value = "a\"b\\c\nd";
+        String member = JsonUtil.userFieldMemberJson(key, value);
+        String written = JsonUtil.mapToJson(Collections.singletonMap(key, value));
+        assertTrue("member [" + member + "] should be contained in written [" + written + "]",
+                written.contains(member));
+    }
+
+    @Test
+    public void userFieldMemberJson_nullValue_matchesWriteEncoding() {
+        // serializeNulls 配置下，写入的 null 值与成员片段的 null 字面量一致
+        Map<String, String> map = new HashMap<>();
+        map.put("k", null);
+        String written = JsonUtil.mapToJson(map);
+        assertTrue(written.contains(JsonUtil.userFieldMemberJson("k", null)));
+    }
+
+    @Test
+    public void userFieldMemberJson_plainMember_notContainedInNullValueRow() {
+        // null 值行不应被非 null 成员误匹配
+        String nullRow = JsonUtil.mapToJson(Collections.singletonMap("k", (String) null));
+        assertFalse(nullRow.contains(JsonUtil.userFieldMemberJson("k", "null")));
     }
 }

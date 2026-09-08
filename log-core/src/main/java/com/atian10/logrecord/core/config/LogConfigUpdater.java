@@ -98,6 +98,10 @@ public final class LogConfigUpdater {
             throw new IllegalArgumentException(
                     "batchIntervalMillis cannot be changed via set(); re-init LogManager instead");
         }
+        if (current.getCapacityCoordinator() != candidate.getCapacityCoordinator()) {
+            throw new IllegalArgumentException(
+                    "capacityCoordinator cannot be changed via set(); re-init LogManager instead");
+        }
     }
 
     /**

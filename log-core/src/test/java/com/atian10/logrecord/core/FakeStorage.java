@@ -5,8 +5,11 @@ import com.atian10.logrecord.core.model.LogLevel;
 import com.atian10.logrecord.core.model.LogRecord;
 import com.atian10.logrecord.core.query.LogQuery;
 import com.atian10.logrecord.core.query.LogStatistics;
+import com.atian10.logrecord.core.query.OrderBy;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,7 +19,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * 内存版 IStorage，用于单元测试。
  * <p>
  * 不实际访问数据库，所有数据存于内存 List。
- * 提供 getWrittenRecords() 助手方法供测试断言。
+ * 提供 getWrittenRecords() 助手方法供测试断言；
+ * 实现导出快照（打开时冻结匹配集合），供导出链路测试使用。
  * </p>
  */
 public class FakeStorage implements IStorage {
@@ -109,6 +113,65 @@ public class FakeStorage implements IStorage {
     @Override
     public long count(LogQuery query) {
         return query(query).size();
+    }
+
+    /**
+     * 打开导出快照：打开时冻结匹配集合（内存实现，按 (timestamp, 到达序) 稳定排序）
+     */
+    @Override
+    public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+        final LogQuery q = query != null ? query : LogQuery.builder().build();
+        List<LogRecord> matched = new ArrayList<>(query(q));
+        // 稳定次序：时间戳为主键，写入到达序（索引）为次键，与真实存储的 (timestamp, id) 对应
+        final Map<LogRecord, Integer> arrivalIndex = new HashMap<>();
+        List<LogRecord> snapshotAll = getWrittenRecords();
+        for (int i = 0; i < snapshotAll.size(); i++) {
+            arrivalIndex.put(snapshotAll.get(i), i);
+        }
+        final boolean descending = q.getOrderBy() == OrderBy.DESC;
+        Comparator<LogRecord> comparator = Comparator
+                .comparingLong(LogRecord::getTimestamp)
+                .thenComparing(r -> arrivalIndex.getOrDefault(r, 0));
+        if (descending) {
+            comparator = comparator.reversed();
+        }
+        Collections.sort(matched, comparator);
+        final List<LogRecord> frozen = Collections.unmodifiableList(matched);
+        return new IExportSnapshot<LogRecord>() {
+            /** 已读取的偏移（冻结集合上偏移分页即一致） */
+            private int offset = 0;
+            private boolean exhausted = frozen.isEmpty();
+
+            @Override
+            public long getCapturedCount() {
+                return frozen.size();
+            }
+
+            @Override
+            public boolean isExhausted() {
+                return exhausted;
+            }
+
+            @Override
+            public List<LogRecord> nextBatch(int maxRows) {
+                if (exhausted || maxRows <= 0) {
+                    exhausted = true;
+                    return new ArrayList<>();
+                }
+                int end = Math.min(frozen.size(), offset + maxRows);
+                List<LogRecord> page = new ArrayList<>(frozen.subList(offset, end));
+                offset = end;
+                if (offset >= frozen.size()) {
+                    exhausted = true;
+                }
+                return page;
+            }
+
+            @Override
+            public void close() {
+                exhausted = true;
+            }
+        };
     }
 
     public List<LogRecord> getWrittenRecords() {

@@ -4,6 +4,7 @@ import com.atian10.logrecord.core.IExceptionStorage;
 import com.atian10.logrecord.core.IFormatter;
 import com.atian10.logrecord.core.ILogFilter;
 import com.atian10.logrecord.core.IStorage;
+import com.atian10.logrecord.core.clean.CapacityCoordinator;
 import com.atian10.logrecord.core.engine.QueueFullPolicy;
 import com.atian10.logrecord.core.export.ExportEncoding;
 
@@ -40,6 +41,8 @@ public final class LogConfig {
     private final int batchSize;
     /** 批量写入周期（毫秒，达到此时长触发落盘） */
     private final long batchIntervalMillis;
+    /** 全库容量协调器（平台适配层提供；null 表示无容量清理能力） */
+    private final CapacityCoordinator capacityCoordinator;
 
     // ===== 动态配置（可运行时修改） =====
 
@@ -57,6 +60,12 @@ public final class LogConfig {
     private final CleanPolicy cleanPolicy;
     /** 异常清理策略（独立于日志清理） */
     private final CleanPolicy exceptionCleanPolicy;
+    /**
+     * 数据库级容量上限（MB）
+     * <p>null 表示未设置（按迁移规则从旧 maxDbSizeMB 推导）；0 表示显式禁用容量限制；
+     * 正数为全库预算。换算口径 1 MB = 1024 × 1024 字节</p>
+     */
+    private final Long databaseMaxSizeMB;
     /** 导出编码（默认 UTF_8） */
     private final ExportEncoding exportEncoding;
 
@@ -73,6 +82,7 @@ public final class LogConfig {
         this.queueFullPolicy = builder.queueFullPolicy;
         this.batchSize = builder.batchSize;
         this.batchIntervalMillis = builder.batchIntervalMillis;
+        this.capacityCoordinator = builder.capacityCoordinator;
         this.consoleEnabled = builder.consoleEnabled;
         this.captureMethodLine = builder.captureMethodLine;
         this.versionTag = builder.versionTag;
@@ -80,7 +90,10 @@ public final class LogConfig {
         this.logFilter = builder.logFilter;
         this.cleanPolicy = builder.cleanPolicy;
         this.exceptionCleanPolicy = builder.exceptionCleanPolicy;
+        this.databaseMaxSizeMB = builder.databaseMaxSizeMB;
         this.exportEncoding = builder.exportEncoding;
+        // 容量预算校验：负值/溢出/新旧冲突统一在此拦截（初始化与动态更新的 build 都经过这里）
+        verifyCapacityConfig(builder);
     }
 
     public IStorage getStorage() {
@@ -105,6 +118,11 @@ public final class LogConfig {
 
     public long getBatchIntervalMillis() {
         return batchIntervalMillis;
+    }
+
+    /** 全库容量协调器（平台适配层提供；null 表示无容量清理能力） */
+    public CapacityCoordinator getCapacityCoordinator() {
+        return capacityCoordinator;
     }
 
     public boolean isConsoleEnabled() {
@@ -135,6 +153,14 @@ public final class LogConfig {
         return exceptionCleanPolicy;
     }
 
+    /**
+     * 数据库级容量上限（MB）
+     * @return null 表示未设置；0 表示显式禁用容量限制；正数为全库预算
+     */
+    public Long getDatabaseMaxSizeMB() {
+        return databaseMaxSizeMB;
+    }
+
     public ExportEncoding getExportEncoding() {
         return exportEncoding;
     }
@@ -160,6 +186,7 @@ public final class LogConfig {
         b.queueFullPolicy = source.queueFullPolicy;
         b.batchSize = source.batchSize;
         b.batchIntervalMillis = source.batchIntervalMillis;
+        b.capacityCoordinator = source.capacityCoordinator;
         b.consoleEnabled = source.consoleEnabled;
         b.captureMethodLine = source.captureMethodLine;
         b.versionTag = source.versionTag;
@@ -167,8 +194,68 @@ public final class LogConfig {
         b.logFilter = source.logFilter;
         b.cleanPolicy = source.cleanPolicy;
         b.exceptionCleanPolicy = source.exceptionCleanPolicy;
+        b.databaseMaxSizeMB = source.databaseMaxSizeMB;
         b.exportEncoding = source.exportEncoding;
         return b;
+    }
+
+    /**
+     * 容量预算校验（B4 迁移规则）
+     * <ul>
+     *   <li>databaseMaxSizeMB 负值或换算溢出：拒绝</li>
+     *   <li>显式 0（禁用）与启用策略中的旧正容量值：冲突</li>
+     *   <li>显式正数与启用策略中的旧正容量值不一致：冲突（需一致或清除旧值）</li>
+     *   <li>未设置且启用策略的旧正容量值不同：冲突（不擅自取小或相加）</li>
+     * </ul>
+     *
+     * @throws IllegalArgumentException 违反上述规则时
+     */
+    private static void verifyCapacityConfig(Builder builder) {
+        Long newSizeMb = builder.databaseMaxSizeMB;
+        if (newSizeMb == null) {
+            long logOld = positiveOldCapacity(builder.cleanPolicy);
+            long expOld = positiveOldCapacity(builder.exceptionCleanPolicy);
+            if (logOld > 0L && expOld > 0L && logOld != expOld) {
+                throw new IllegalArgumentException(
+                        "enabled cleanPolicies declare different maxDbSizeMB values ("
+                                + logOld + " vs " + expOld
+                                + "); align them or set databaseMaxSizeMB explicitly");
+            }
+            return;
+        }
+        if (newSizeMb < 0L) {
+            throw new IllegalArgumentException("databaseMaxSizeMB must be >= 0 (0 = disable)");
+        }
+        if (newSizeMb != 0L && newSizeMb > Long.MAX_VALUE / CapacityBudgets.BYTES_PER_MB) {
+            throw new IllegalArgumentException("databaseMaxSizeMB overflows byte budget: " + newSizeMb);
+        }
+        long logOld = positiveOldCapacity(builder.cleanPolicy);
+        long expOld = positiveOldCapacity(builder.exceptionCleanPolicy);
+        if (newSizeMb == 0L) {
+            if (logOld > 0L || expOld > 0L) {
+                throw new IllegalArgumentException(
+                        "databaseMaxSizeMB=0 (disable) conflicts with legacy maxDbSizeMB "
+                                + "in enabled policies; remove the legacy values first");
+            }
+            return;
+        }
+        if ((logOld > 0L && logOld != newSizeMb) || (expOld > 0L && expOld != newSizeMb)) {
+            throw new IllegalArgumentException(
+                    "databaseMaxSizeMB=" + newSizeMb
+                            + " conflicts with legacy maxDbSizeMB in enabled policies (log="
+                            + logOld + ", exception=" + expOld
+                            + "); align or clear the legacy values");
+        }
+    }
+
+    /**
+     * 启用策略中的旧正容量值，未启用或未配置返回 0
+     */
+    private static long positiveOldCapacity(CleanPolicy policy) {
+        if (policy == null || !policy.isEnabled() || policy.getMaxDbSizeMB() <= 0L) {
+            return 0L;
+        }
+        return policy.getMaxDbSizeMB();
     }
 
     /**
@@ -188,6 +275,7 @@ public final class LogConfig {
         private QueueFullPolicy queueFullPolicy = QueueFullPolicy.DROP_OLDEST;
         private int batchSize = 100;
         private long batchIntervalMillis = 1000L;
+        private CapacityCoordinator capacityCoordinator;
         private boolean consoleEnabled = false;
         private boolean captureMethodLine = false;
         private String versionTag;
@@ -195,6 +283,8 @@ public final class LogConfig {
         private ILogFilter logFilter;
         private CleanPolicy cleanPolicy = CleanPolicy.builder().build();
         private CleanPolicy exceptionCleanPolicy = CleanPolicy.builder().build();
+        /** 数据库级容量上限（MB）；null=未设置，0=显式禁用 */
+        private Long databaseMaxSizeMB;
         private ExportEncoding exportEncoding = ExportEncoding.UTF_8;
 
         public Builder storage(IStorage storage) {
@@ -224,6 +314,16 @@ public final class LogConfig {
 
         public Builder batchIntervalMillis(long batchIntervalMillis) {
             this.batchIntervalMillis = batchIntervalMillis;
+            return this;
+        }
+
+        /**
+         * 设置全库容量协调器（平台适配层提供）
+         * <p>静态配置：初始化后不可通过 set() 替换。null（默认）表示无容量清理能力，
+         * 存在有效预算时容量阶段将记录"缺少容量协调器"并跳过</p>
+         */
+        public Builder capacityCoordinator(CapacityCoordinator capacityCoordinator) {
+            this.capacityCoordinator = capacityCoordinator;
             return this;
         }
 
@@ -260,6 +360,16 @@ public final class LogConfig {
         public Builder exceptionCleanPolicy(CleanPolicy exceptionCleanPolicy) {
             this.exceptionCleanPolicy = exceptionCleanPolicy == null
                     ? CleanPolicy.builder().build() : exceptionCleanPolicy;
+            return this;
+        }
+
+        /**
+         * 设置数据库级容量上限（MB）
+         * <p>null 表示未设置（按迁移规则从启用策略的旧 maxDbSizeMB 推导）；
+         * 0 表示显式禁用容量限制；正数为全库预算。负值与换算溢出在 build() 拒绝</p>
+         */
+        public Builder databaseMaxSizeMB(Long databaseMaxSizeMB) {
+            this.databaseMaxSizeMB = databaseMaxSizeMB;
             return this;
         }
 

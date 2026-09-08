@@ -2,6 +2,7 @@ package com.atian10.logrecord.android;
 
 import android.util.Log;
 
+import com.atian10.logrecord.core.IExportSnapshot;
 import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.config.CleanPolicy;
 import com.atian10.logrecord.core.model.LogLevel;
@@ -102,6 +103,14 @@ public final class LogcatStorage implements IStorage {
     @Override
     public long count(LogQuery query) {
         return delegate.count(query);
+    }
+
+    /**
+     * 转发导出快照能力到被装饰存储（包装层不引入额外一致性语义）
+     */
+    @Override
+    public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+        return delegate.openExportSnapshot(query);
     }
 
     /**

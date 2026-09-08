@@ -110,11 +110,15 @@ public final class AndroidLogInit {
                 ? new LogcatStorage(roomStorage, true)
                 : roomStorage;
 
-        // 4. 重建最终配置：storage 用装饰后的，consoleEnabled 强制 false
+        // 4. 重建最终配置：storage 用装饰后的，consoleEnabled 强制 false，
+        //    并注入全库容量协调器（B4：一个数据库一个协调器，与两存储共享 Room 实例）
+        RoomCapacityCoordinator coordinator = new RoomCapacityCoordinator(
+                db, roomStorage, exceptionStorage);
         LogConfig finalConfig = LogConfig.builderFrom(tempConfig)
                 .storage(effectiveStorage)
                 .exceptionStorage(exceptionStorage)
-                .consoleEnabled(false)  // Logcat 输出由装饰器处理，避免 System.out 重复
+                .consoleEnabled(false)  // Logcat 输出由装饰器处理，避免 System.out 重复输出
+                .capacityCoordinator(coordinator)
                 .build();
 
         return LogManager.init(finalConfig);
@@ -130,19 +134,59 @@ public final class AndroidLogInit {
 
     /**
      * 关闭日志库并释放数据库资源
+     * <p>
+     * 等待 LogManager 完成排空后才关闭数据库；超时未终止时由后台守护线程
+     * 等待其完全终止后再关闭，避免在途写入被数据库关闭中断。
+     * </p>
      */
     public static void shutdown() {
+        LogDatabase db = database;
+        database = null;
+        LogManager resolved = null;
         if (LogManager.isInitialized()) {
-            LogManager.get().shutdown();
-        }
-        if (database != null) {
             try {
-                database.close();
-            } catch (Throwable t) {
-                // 关闭失败不阻塞，但输出到 logcat 便于业务方诊断
-                Log.w("LogRecord", "database.close() failed: " + t.getMessage(), t);
+                resolved = LogManager.get();
+            } catch (IllegalStateException ignored) {
+                // 并发关闭竞态：实例已被其他线程清除，无需再关闭引擎
             }
-            database = null;
+        }
+        // final 副本供后台关闭线程引用
+        final LogManager manager = resolved;
+        if (manager != null) {
+            manager.shutdown();
+        }
+        if (db == null) {
+            return;
+        }
+        if (manager == null || manager.isTerminated()) {
+            closeDatabase(db);
+            return;
+        }
+        // 排空超时：后台等待完全终止后再关闭数据库
+        Thread closer = new Thread(() -> {
+            while (!manager.isTerminated()) {
+                try {
+                    Thread.sleep(100L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            closeDatabase(db);
+        }, "log-record-db-closer");
+        closer.setDaemon(true);
+        closer.start();
+    }
+
+    /**
+     * 关闭 Room 数据库（失败输出 logcat，不阻塞）
+     */
+    private static void closeDatabase(LogDatabase db) {
+        try {
+            db.close();
+        } catch (Throwable t) {
+            // 关闭失败不阻塞，但输出到 logcat 便于业务方诊断
+            Log.w("LogRecord", "database.close() failed: " + t.getMessage(), t);
         }
     }
 

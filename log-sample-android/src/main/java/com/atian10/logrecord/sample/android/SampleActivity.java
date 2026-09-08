@@ -11,6 +11,7 @@ import android.widget.Button;
 
 import com.atian10.logrecord.core.LogManager;
 import com.atian10.logrecord.core.config.LogConfigUpdater;
+import com.atian10.logrecord.core.engine.FlushResult;
 import com.atian10.logrecord.core.export.ExportCallback;
 import com.atian10.logrecord.core.export.ExportFormat;
 import com.atian10.logrecord.core.model.LogLevel;
@@ -25,6 +26,8 @@ import java.io.File;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Android 示例 Activity
@@ -39,6 +42,12 @@ import java.util.Map;
  * </ul>
  * </p>
  * <p>
+ * <b>线程模型（ISSUE-06 修复）</b>：导出、清理、flush 等待与关闭等待等数据库/文件/
+ * 阻塞操作统一提交到本 Activity 的受控后台执行器（单线程串行，避免并发导出），
+ * 只在主线程更新界面；页面销毁后忽略晚到回调并释放执行器（排队任务执行完毕，
+ * 其中 flush 作为收尾任务保留）。错误同时输出到界面，不只依赖 Logcat。
+ * </p>
+ * <p>
  * 注意：日志库初始化已在 {@link SampleApp#onCreate()} 中完成，Activity 直接使用 LogManager.get()。
  * </p>
  */
@@ -46,8 +55,21 @@ public class SampleActivity extends Activity {
 
     private static final String TAG = "SampleActivity";
 
+    /** flush 等待时限（毫秒）：后台等待，不阻塞主线程 */
+    private static final long FLUSH_TIMEOUT_MILLIS = 5000L;
+
     private TextView mOutputView;
     private LogManager mLogger;
+
+    /** 受控后台执行器：导出/清理/flush 等待串行执行，避免主线程数据库访问与并发导出 */
+    private final ExecutorService backgroundExecutor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "sample-bg-executor");
+                t.setDaemon(true);
+                return t;
+            });
+    /** 页面是否已销毁：销毁后忽略晚到回调，不再触碰界面 */
+    private volatile boolean destroyed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -106,10 +128,11 @@ public class SampleActivity extends Activity {
             mLogger.w(TAG, "警告信息：内存占用较高");
             mLogger.e(TAG, "错误信息：网络请求失败");
             mLogger.f(TAG, "致命错误：核心组件崩溃");
-            mLogger.flush();   // 立即触发落盘（演示用，生产环境无需频繁 flush）
             appendOutput("已写入 5 条各级别日志");
+            // flush 是等待操作：放到后台执行器，不阻塞主线程（ISSUE-06）
+            flushInBackground("writeLogs");
         } catch (Throwable t) {
-            Log.e(TAG, "writeLogs failed", t);
+            reportError("writeLogs", t);
         }
     }
 
@@ -133,10 +156,10 @@ public class SampleActivity extends Activity {
                     "用户登录失败",
                     fields);
 
-            mLogger.flush();
             appendOutput("已写入异常日志和带用户字段的日志");
+            flushInBackground("writeExceptionLog");
         } catch (Throwable t) {
-            Log.e(TAG, "writeExceptionLog failed", t);
+            reportError("writeExceptionLog", t);
         }
     }
 
@@ -162,10 +185,9 @@ public class SampleActivity extends Activity {
                             .append(r.getTag()).append(" : ").append(r.getMessage())
                             .append("\n");
                 }
-                runOnUiThread(() -> appendOutput(sb.toString()));
+                postToUi(() -> appendOutput(sb.toString()));
             } catch (Throwable t) {
-                Log.e(TAG, "queryErrorLogs failed", t);
-                runOnUiThread(() -> appendOutput("查询失败: " + t.getMessage()));
+                reportError("queryErrorLogs", t);
             }
         }, "query-error-logs").start();
     }
@@ -186,10 +208,9 @@ public class SampleActivity extends Activity {
                 sb.append("  按级别: ").append(stats.getCountByLevel()).append("\n");
                 sb.append("  按类型: ").append(stats.getCountByType()).append("\n");
                 sb.append("  按Tag: ").append(stats.getCountByTag()).append("\n");
-                runOnUiThread(() -> appendOutput(sb.toString()));
+                postToUi(() -> appendOutput(sb.toString()));
             } catch (Throwable t) {
-                Log.e(TAG, "showStatistics failed", t);
-                runOnUiThread(() -> appendOutput("统计失败: " + t.getMessage()));
+                reportError("showStatistics", t);
             }
         }, "show-statistics").start();
     }
@@ -215,10 +236,9 @@ public class SampleActivity extends Activity {
                             .append(": ").append(e.getExceptionMessage())
                             .append("\n");
                 }
-                runOnUiThread(() -> appendOutput(sb.toString()));
+                postToUi(() -> appendOutput(sb.toString()));
             } catch (Throwable t) {
-                Log.e(TAG, "queryExceptions failed", t);
-                runOnUiThread(() -> appendOutput("查询异常失败: " + t.getMessage()));
+                reportError("queryExceptions", t);
             }
         }, "query-exceptions").start();
     }
@@ -226,47 +246,53 @@ public class SampleActivity extends Activity {
     // ===== 导出示例 =====
 
     private void exportLogs(ExportFormat format) {
-        try {
-            // 导出到应用缓存目录（无需存储权限）
-            File exportDir = new File(getExternalCacheDir(), "log-export");
-            if (!exportDir.exists()) {
-                exportDir.mkdirs();
+        // 导出含快照复制、数据库分页与文件写入：必须离开主线程（ISSUE-06）
+        backgroundExecutor.execute(() -> {
+            try {
+                // 导出到应用缓存目录（无需存储权限）
+                File exportDir = new File(getExternalCacheDir(), "log-export");
+                if (!exportDir.exists()) {
+                    exportDir.mkdirs();
+                }
+                String ext = format == ExportFormat.JSON ? "json"
+                        : format == ExportFormat.CSV ? "csv" : "txt";
+                File exportFile = new File(exportDir,
+                        "logs_" + System.currentTimeMillis() + "." + ext);
+
+                long now = System.currentTimeMillis();
+                long oneHourAgo = now - 3600_000L;
+                mLogger.exportLogs(
+                        LogQuery.builder()
+                                .fromTime(oneHourAgo)
+                                .toTime(now)
+                                .orderBy(OrderBy.ASC)
+                                .build(),
+                        format,
+                        exportFile.getAbsolutePath(),
+                        new ExportCallback() {
+                            @Override
+                            public void onProgress(int exported, int total) {
+                                postToUi(() -> appendOutput(
+                                        "导出进度: " + exported + "/" + total));
+                            }
+
+                            @Override
+                            public void onSuccess(String filePath, int totalCount) {
+                                postToUi(() -> appendOutput(
+                                        "导出 " + format + " 成功: " + filePath
+                                                + " (" + totalCount + " 条)"));
+                            }
+
+                            @Override
+                            public void onFailure(Throwable error, int exportedCount) {
+                                postToUi(() -> appendOutput(
+                                        "导出失败: " + error));
+                            }
+                        });
+            } catch (Throwable t) {
+                reportError("exportLogs", t);
             }
-            String ext = format == ExportFormat.JSON ? "json"
-                    : format == ExportFormat.CSV ? "csv" : "txt";
-            File exportFile = new File(exportDir, "logs_" + System.currentTimeMillis() + "." + ext);
-
-            long now = System.currentTimeMillis();
-            long oneHourAgo = now - 3600_000L;
-            mLogger.exportLogs(
-                    LogQuery.builder()
-                            .fromTime(oneHourAgo)
-                            .toTime(now)
-                            .orderBy(OrderBy.ASC)
-                            .build(),
-                    format,
-                    exportFile.getAbsolutePath(),
-                    new ExportCallback() {
-                        @Override
-                        public void onProgress(int exported, int total) {
-                        }
-
-                        @Override
-                        public void onSuccess(String filePath, int totalCount) {
-                            runOnUiThread(() -> appendOutput(
-                                    "导出 " + format + " 成功: " + filePath
-                                            + " (" + totalCount + " 条)"));
-                        }
-
-                        @Override
-                        public void onFailure(Throwable error, int exportedCount) {
-                            runOnUiThread(() -> appendOutput(
-                                    "导出失败: " + error.getMessage()));
-                        }
-                    });
-        } catch (Throwable t) {
-            Log.e(TAG, "exportLogs failed", t);
-        }
+        });
     }
 
     // ===== 动态配置示例 =====
@@ -287,49 +313,105 @@ public class SampleActivity extends Activity {
             appendOutput("动态配置已更新: versionTag=" + next
                     + ", captureMethodLine=" + (!capture));
         } catch (Throwable t) {
-            Log.e(TAG, "updateConfig failed", t);
+            reportError("updateConfig", t);
         }
     }
 
     // ===== 清理示例 =====
 
     private void cleanNow() {
-        try {
-            mLogger.cleanNow(new com.atian10.logrecord.core.clean.CleanCallback() {
-                @Override
-                public void onSuccess(int cleanedCount) {
-                    runOnUiThread(() -> appendOutput("清理完成，清理 " + cleanedCount + " 条"));
-                }
+        // 清理含数据库删除与全库容量维护：必须离开主线程（ISSUE-06）
+        backgroundExecutor.execute(() -> {
+            try {
+                mLogger.cleanNow(new com.atian10.logrecord.core.clean.CleanCallback() {
+                    @Override
+                    public void onSuccess(int cleanedCount) {
+                        postToUi(() -> appendOutput("清理完成，清理 " + cleanedCount + " 条"));
+                    }
 
-                @Override
-                public void onFailure(Throwable error) {
-                    runOnUiThread(() -> appendOutput("清理失败: " + error.getMessage()));
+                    @Override
+                    public void onFailure(Throwable error) {
+                        postToUi(() -> appendOutput("清理失败: " + error));
+                    }
+                });
+            } catch (Throwable t) {
+                reportError("cleanNow", t);
+            }
+        });
+    }
+
+    // ===== 后台等待与收尾 =====
+
+    /**
+     * 在后台执行器上等待 flush 完成，并在界面反馈结果
+     * <p>flush 是阻塞等待（含存储写入完成确认），不得在主线程执行</p>
+     */
+    private void flushInBackground(String source) {
+        backgroundExecutor.execute(() -> {
+            try {
+                FlushResult result = mLogger.flush(FLUSH_TIMEOUT_MILLIS);
+                if (result.isAllPersisted()) {
+                    postToUi(() -> appendOutput(
+                            "[" + source + "] flush 完成: 保存 " + result.getSaved() + " 条"));
+                } else {
+                    postToUi(() -> appendOutput(
+                            "[" + source + "] flush 未完全落盘: " + result));
                 }
-            });
-        } catch (Throwable t) {
-            Log.e(TAG, "cleanNow failed", t);
-        }
+            } catch (Throwable t) {
+                reportError("flush(" + source + ")", t);
+            }
+        });
     }
 
     // ===== UI 辅助 =====
 
-    private void appendOutput(String text) {
+    /**
+     * 安全地把操作转到主线程：页面销毁后忽略，不触碰已废弃界面
+     */
+    private void postToUi(Runnable action) {
+        if (destroyed) {
+            return;
+        }
         runOnUiThread(() -> {
-            CharSequence old = mOutputView.getText();
-            String newText = (old.length() == 0 ? "" : old + "\n") + text;
-            mOutputView.setText(newText);
+            if (!destroyed) {
+                action.run();
+            }
         });
+    }
+
+    private void appendOutput(String text) {
+        CharSequence old = mOutputView.getText();
+        String newText = (old.length() == 0 ? "" : old + "\n") + text;
+        mOutputView.setText(newText);
+    }
+
+    /**
+     * 统一错误反馈：界面输出 + Logcat（不只依赖 Logcat，ISSUE-06）
+     */
+    private void reportError(String where, Throwable t) {
+        Log.e(TAG, where + " failed", t);
+        postToUi(() -> appendOutput(where + " 失败: " + t));
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        // Activity 销毁时 flush 一下，避免队列残留（Application 销毁时由 AndroidLogInit.shutdown 关闭）
+        // 销毁后忽略晚到回调；flush 作为收尾任务入队，执行器关闭后排队任务仍会执行完
+        destroyed = true;
         try {
             if (LogManager.isInitialized()) {
-                LogManager.get().flush();
+                backgroundExecutor.execute(() -> {
+                    try {
+                        LogManager.get().flush(FLUSH_TIMEOUT_MILLIS);
+                    } catch (Throwable ignored) {
+                        // 收尾 flush 失败不再反馈界面（页面已销毁）
+                    }
+                });
             }
         } catch (Throwable ignored) {
+            // 初始化竞态下跳过收尾 flush
         }
+        backgroundExecutor.shutdown();
+        // 不阻塞 onDestroy 等待线程退出；Application 销毁时由 AndroidLogInit.shutdown 关闭日志库
     }
 }

@@ -17,12 +17,21 @@ public interface IExceptionStorage {
 
     /**
      * 写入单条异常
+     * <p>
+     * 写入失败时应抛出异常（推荐 {@link BatchWriteException} 携带已保存数量），
+     * 由异步引擎统一容错计数；不应静默吞掉失败。
+     * </p>
      * @param record 异常记录
      */
     void write(ExceptionRecord record);
 
     /**
      * 批量写入异常（异步引擎攒批后调用）
+     * <p>
+     * 写入失败时应抛出异常（推荐 {@link BatchWriteException} 携带已保存数量）。
+     * 批量降级重试由存储实现自行决定并在内部完成后上报最终数量；
+     * 提交结果不确定的事务禁止自动重放，避免重复写入。
+     * </p>
      * @param records 异常记录列表
      */
     void writeBatch(List<ExceptionRecord> records);
@@ -73,4 +82,23 @@ public interface IExceptionStorage {
      * @return 记录数
      */
     long count(ExceptionQuery query);
+
+    /**
+     * 打开异常表的一致性导出快照
+     * <p>
+     * 语义与 {@link IStorage#openExportSnapshot(LogQuery)} 相同：ID 边界、
+     * {@code (timestamp, id)} 双键稳定次序、清理互斥与严格读取。
+     * 默认实现明确报告不支持；自定义存储需提供适配才能继续导出。
+     * </p>
+     *
+     * @param query 查询条件（分页参数被忽略，排序由快照固定）
+     * @return 导出快照；使用方负责 {@link IExportSnapshot#close()}
+     * @throws UnsupportedOperationException 存储未提供快照适配
+     * @throws ExportSnapshotException 边界捕获失败
+     */
+    default IExportSnapshot<ExceptionRecord> openExportSnapshot(ExceptionQuery query) {
+        throw new UnsupportedOperationException(
+                "exception storage does not implement openExportSnapshot; "
+                        + "adapt it to keep export available");
+    }
 }

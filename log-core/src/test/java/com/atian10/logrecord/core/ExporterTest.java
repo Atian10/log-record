@@ -52,7 +52,9 @@ public class ExporterTest {
         assertEquals(5, count);
         List<String> lines = readLines(file);
         assertEquals(5, lines.size());
-        assertTrue(lines.get(0).contains("msg0"));
+        // 默认 DESC 且种子时间戳相同：(timestamp, 到达序) 稳定降序 → 首行为最后写入的 msg4
+        assertTrue("first line should be latest record, got: " + lines.get(0),
+                lines.get(0).contains("msg4"));
     }
 
     @Test
