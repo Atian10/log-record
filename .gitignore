@@ -13,6 +13,11 @@ build/
 .project
 .classpath
 
+# Java 编译输出
+/log-core/bin/
+/log-desktop/bin/
+/log-sample/bin/
+
 # Android
 local.properties
 *.apk
