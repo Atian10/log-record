@@ -24,11 +24,34 @@ tasks.withType(JavaCompile) {
     options.release = 11
 }
 
+// 二进制与源码包均从根许可证取值；模块专属路径避免多模块消费时资源重名。
+tasks.withType(Jar).configureEach {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF/log-record/log-core'
+    }
+}
+
 // 从 Java 组件发布，保留 Gson 等传递依赖及 Java 11 兼容属性。
 publishing {
     publications {
         mavenJava(MavenPublication) {
             from components.java
+            pom {
+                name = 'log-record core'
+                description = 'Java 11 logging contracts, asynchronous engine, queries and export.'
+                url = 'https://github.com/Atian10/log-record'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/license/mit'
+                        distribution = 'repo'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:https://github.com/Atian10/log-record.git'
+                    url = 'https://github.com/Atian10/log-record'
+                }
+            }
         }
     }
 }

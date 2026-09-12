@@ -9,7 +9,7 @@ param(
     [string]$JavaHome = 'E:\Java\temurin-11',
     [string]$SdkDirectory = 'E:\AndroidDev\Sdk',
     # 可显式选择受影响的验证阶段；每次调用生成独立日志和源码指纹。
-    [ValidateSet('Environment','Tests','Android','Lint','Publish','Consumers','Artifacts')]
+    [ValidateSet('Environment','Tests','Android','Lint','Publish','Consumers','PublicationArtifacts','Artifacts')]
     [string[]]$Stages = @('Environment','Tests','Android','Lint','Publish','Consumers','Artifacts'),
     [ValidatePattern('^[a-zA-Z0-9-]+$')]
     [string]$RunId = ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -301,14 +301,49 @@ function Invoke-GradleVerification([string]$Name, [string[]]$Tasks, [string]$Pro
 }
 
 function New-ConsumerProjects {
-    # 仅生成合成消费工程：编译 API 调用和依赖图，不启动应用或示例。
+    # 三个独立消费入口只编译和核对解析图；不调用库初始化或执行数据库操作。
     $repositoryUri = ([uri](Join-Path $runRoot 'm2')).AbsoluteUri
     $javaConsumer = Join-Path $runRoot 'consumers/consumer-java'
     $androidConsumer = Join-Path $runRoot 'consumers/consumer-android'
+    # 直接 core 消费方可以发现仅由平台适配层掩盖的公开依赖缺失。
+    $coreConsumer = Join-Path $runRoot 'consumers/consumer-core'
+    Write-VerificationText (Join-Path $coreConsumer 'settings.gradle') "rootProject.name = 'consumer-core'"
+    Write-VerificationText (Join-Path $coreConsumer 'build.gradle') @"
+plugins { id 'java' }
+java { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
+tasks.withType(JavaCompile).configureEach { options.release = 11 }
+repositories { maven { url '$repositoryUri' }; mavenCentral() }
+dependencies { implementation 'com.github.Atian10.log-record:log-core:0.0.0-local-validation' }
+// 断言原始发布制品来自本轮 m2，不运行 Consumer 中的方法。
+tasks.register('verifyRuntimeGraph') {
+    doLast {
+        // 直接核心模块仅应解析自身和 Gson；禁止平台依赖倒流。
+        def artifacts = configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts
+        def names = artifacts.collect { it.name }.sort()
+        assert names == ['gson', 'log-core'] : names
+        artifacts.findAll { it.name.startsWith('log-') }.each {
+            assert it.moduleVersion.id.group == 'com.github.Atian10.log-record'
+            assert it.moduleVersion.id.version == '0.0.0-local-validation'
+            assert it.file.canonicalFile.toPath().startsWith(new File(new URI('$repositoryUri')).canonicalFile.toPath()) : it.file
+        }
+        println names
+    }
+}
+"@
+    Write-VerificationText (Join-Path $coreConsumer 'src/main/java/Consumer.java') @'
+import com.atian10.logrecord.core.config.LogConfig;
+import com.google.gson.Gson;
+/** 仅编译核心 API 及传递 Gson API，不运行。 */
+public final class Consumer {
+    /** 合成入口验证类型可用，不产生日志或数据库。 */
+    public static LogConfig.Builder configuration(Gson gson) { return new LogConfig.Builder(); }
+}
+'@
     Write-VerificationText (Join-Path $javaConsumer 'settings.gradle') "rootProject.name = 'consumer-java'"
     Write-VerificationText (Join-Path $javaConsumer 'build.gradle') @"
 plugins { id 'java' }
 java { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
+tasks.withType(JavaCompile).configureEach { options.release = 11 }
 repositories { maven { url '$repositoryUri' }; mavenCentral() }
 dependencies { implementation 'com.github.Atian10.log-record:log-desktop:0.0.0-local-validation' }
 tasks.register('verifyRuntimeGraph') {
@@ -347,24 +382,34 @@ android {
     compileSdk 33
     defaultConfig { applicationId 'com.atian10.logrecord.verification'; minSdk 21; targetSdk 33; versionCode 1; versionName 'local' }
     compileOptions { sourceCompatibility JavaVersion.VERSION_11; targetCompatibility JavaVersion.VERSION_11 }
+    // 消费方 Release 只做未签名打包及 R8，不安装或运行。
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
 }
 repositories { maven { url '$repositoryUri' }; google(); mavenCentral() }
 dependencies { implementation 'com.github.Atian10.log-record:log-android:0.0.0-local-validation' }
 tasks.register('verifyRuntimeGraph') {
     doLast {
-        def artifacts = configurations.debugRuntimeClasspath.resolvedConfiguration.resolvedArtifacts
-        def names = artifacts.collect { it.name }
-        assert names.containsAll(['log-android', 'log-core', 'gson', 'room-runtime']) : names
-        assert !names.contains('log-desktop') && !names.contains('sqlite-jdbc') : names
-        artifacts.findAll { it.moduleVersion.id.group == 'org.jetbrains.kotlin' && it.name.startsWith('kotlin-stdlib') }.each {
-            assert it.moduleVersion.id.version == '1.8.0' : it.moduleVersion.id
+        // 两个消费变体均需取得相同的平台依赖和 Kotlin 对齐结果。
+        ['debugRuntimeClasspath', 'releaseRuntimeClasspath'].each { configurationName ->
+            def artifacts = configurations.getByName(configurationName).resolvedConfiguration.resolvedArtifacts
+            def names = artifacts.collect { it.name }
+            assert names.containsAll(['log-android', 'log-core', 'gson', 'room-runtime']) : names
+            assert !names.contains('log-desktop') && !names.contains('sqlite-jdbc') : names
+            artifacts.findAll { it.moduleVersion.id.group == 'org.jetbrains.kotlin' && it.name.startsWith('kotlin-stdlib') }.each {
+                assert it.moduleVersion.id.version == '1.8.0' : it.moduleVersion.id
+            }
+            artifacts.findAll { it.name.startsWith('log-') }.each {
+                assert it.moduleVersion.id.group == 'com.github.Atian10.log-record'
+                assert it.moduleVersion.id.version == '0.0.0-local-validation'
+                assert it.file.canonicalFile.toPath().startsWith(new File(new URI('$repositoryUri')).canonicalFile.toPath()) : it.file
+            }
+            println configurationName + ': ' + names.sort()
         }
-        artifacts.findAll { it.name.startsWith('log-') }.each {
-            assert it.moduleVersion.id.group == 'com.github.Atian10.log-record'
-            assert it.moduleVersion.id.version == '0.0.0-local-validation'
-            assert it.file.canonicalFile.toPath().startsWith(new File(new URI('$repositoryUri')).canonicalFile.toPath()) : it.file
-        }
-        println names.sort()
     }
 }
 "@
@@ -495,10 +540,32 @@ if ('Consumers' -in $Stages) {
     $consumersReceipt = Start-VerificationStage 'Consumers' @('Publish')
     Initialize-VerificationDebugKey
     New-ConsumerProjects
+    Invoke-GradleVerification 'consume-core' @('classes','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-core')
     Invoke-GradleVerification 'consume-java' @('classes','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-java')
-    Invoke-GradleVerification 'consume-android' @('assembleDebug','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-android')
+    Invoke-GradleVerification 'consume-android' @('assembleDebug','assembleRelease','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-android')
     Complete-VerificationStage $consumersReceipt @((Join-Path $runRoot 'consumers'),
-        (Join-Path $runRoot 'modules/consumer-java/classes/java/main'), (Join-Path $runRoot 'modules/consumer-android/outputs/apk'))
+        (Join-Path $runRoot 'modules/consumer-core/classes/java/main'), (Join-Path $runRoot 'modules/consumer-java/classes/java/main'),
+        (Join-Path $runRoot 'modules/consumer-android/outputs/apk'), (Join-Path $runRoot 'modules/consumer-android/outputs/mapping/release'))
+}
+if ('PublicationArtifacts' -in $Stages) {
+    # 独立发布验收只承接本轮 Publish/Consumers，不降低下方完整 Artifacts 的前置要求。
+    $publicationReceipt = Start-VerificationStage 'PublicationArtifacts' @('Publish','Consumers')
+    $publicationChecks = @(& (Join-Path $PSScriptRoot 'check-verification-artifacts.ps1') -RunRoot $runRoot -Workspace $workspace -Scope Publication)
+    # 发布会运行 Room 注解处理器；仅比较隔离 schema，不覆盖原文件。
+    $schemaRelative = 'com.atian10.logrecord.android.room.LogDatabase/1.json'
+    $schemaOriginal = Get-Content -LiteralPath (Join-Path $workspace "log-android/schemas/$schemaRelative") -Raw | ConvertFrom-Json -AsHashtable
+    $schemaGenerated = Get-Content -LiteralPath (Join-Path $runRoot "schemas/$schemaRelative") -Raw | ConvertFrom-Json -AsHashtable
+    if ((ConvertTo-Json -InputObject $schemaOriginal -Depth 100 -Compress) -cne
+        (ConvertTo-Json -InputObject $schemaGenerated -Depth 100 -Compress)) { throw '发布生成的 Room schema 与源码不一致。' }
+    Write-VerificationText (Join-Path $attemptRoot 'publication-checks.json') (ConvertTo-Json -InputObject $publicationChecks -Depth 8)
+    # 单独记录本轮分发文件及消费者结果的身份，历史完整验收报告保持原样。
+    $publicationHashes = @(Get-OutputHashes @((Join-Path $runRoot 'm2/com/github/Atian10/log-record'),
+        (Join-Path $runRoot 'modules/consumer-core/classes/java/main'), (Join-Path $runRoot 'modules/consumer-java/classes/java/main'),
+        (Join-Path $runRoot 'modules/consumer-android/outputs')))
+    Write-VerificationText (Join-Path $attemptRoot 'publication-artifacts.json') (ConvertTo-Json -InputObject $publicationHashes -Depth 6)
+    Complete-VerificationStage $publicationReceipt @((Join-Path $attemptRoot 'publication-checks.json'),
+        (Join-Path $attemptRoot 'publication-artifacts.json'), (Join-Path $runRoot 'schemas'))
+    Write-Output 'PASS publication-artifacts-and-schema'
 }
 if ('Artifacts' -in $Stages) {
     # 聚合验收必须先通过所有必需阶段的输入、依赖和输出校验，不能拼接旧产物。

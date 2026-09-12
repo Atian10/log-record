@@ -1,0 +1,108 @@
+log-record third-party notices
+=============================
+
+Scope and license separation
+----------------------------
+Original log-record code is covered by the root MIT LICENSE, which remains
+unchanged. That MIT license does not relicense the Gradle Wrapper or any
+external dependency. The three published library modules are ordinary
+JAR/AAR artifacts, not shaded bundles of their runtime dependencies.
+Consumers and distributors must retain the applicable notices of the
+artifacts they actually redistribute.
+
+This inventory reflects declared versions and inspected cached POM/license
+files on 2026-09-13. It is not a complete inventory of every possible
+consumer's resolved graph or of all build-tool dependencies.
+
+1. Files bundled with the source checkout
+----------------------------------------
+Gradle Wrapper 7.5 (gradlew, gradlew.bat and gradle/wrapper bootstrap files)
+  License: Apache License, Version 2.0
+  Notice: licenses/Gradle-Wrapper-NOTICE.txt
+  License text: licenses/Apache-2.0.txt
+  Project: https://github.com/gradle/gradle/tree/v7.5.0
+
+The Apache-2.0 text was copied without changes from the Apache section
+(Sections 1 through 9, through END OF TERMS AND CONDITIONS) of the locally
+available Gradle 7.5 distribution LICENSE. Gradle's following inventory of
+other distribution components was deliberately excluded. The non-normative
+application appendix was absent from that section and was not invented.
+Canonical complete license, including the appendix:
+  https://www.apache.org/licenses/LICENSE-2.0.txt
+
+2. Declared external library dependencies
+----------------------------------------
+com.google.code.gson:gson:2.10.1
+  Used by log-core, and transitively by both platform modules.
+  License: Apache License, Version 2.0 (cached POM and JAR manifest).
+  Project: https://github.com/google/gson
+
+androidx.room:room-runtime:2.5.2
+androidx.annotation:annotation:1.6.0
+  Used by log-android.
+  License: Apache License, Version 2.0 (cached POMs).
+  Projects: https://developer.android.com/jetpack/androidx/releases/room
+            https://developer.android.com/jetpack/androidx/releases/annotation
+
+org.jetbrains.kotlin:kotlin-bom:1.8.0
+  A dependency alignment platform used by log-android, not an embedded
+  executable library. Resolved Kotlin standard-library artifacts retain
+  their own notices.
+  License: Apache License, Version 2.0 (cached BOM POM).
+  Project: https://github.com/JetBrains/kotlin
+
+org.xerial:sqlite-jdbc:3.42.0.0
+  Used by log-desktop. This driver also carries native SQLite libraries.
+  Main driver license: Apache License, Version 2.0 (cached POM and
+  META-INF/maven/org.xerial/sqlite-jdbc/LICENSE in the dependency JAR).
+  Additional inherited license: LICENSE.zentus, reproduced below.
+  Project: https://github.com/xerial/sqlite-jdbc
+  SQLite itself is dedicated to the public domain by its authors; this
+  does not remove the JDBC driver's Apache and inherited obligations.
+  SQLite source statement: https://www.sqlite.org/copyright.html
+
+Examples of transitive Android/JVM components inspected in cached POMs:
+  androidx.room:room-common:2.5.2
+  androidx.sqlite:sqlite:2.3.1
+  androidx.sqlite:sqlite-framework:2.3.1
+  androidx.arch.core:core-runtime:2.0.1
+  androidx.arch.core:core-common:2.0.1
+  androidx.annotation:annotation-experimental:1.1.0
+  org.jetbrains.kotlin:kotlin-stdlib:1.8.0
+  org.jetbrains:annotations:13.0
+Their inspected POMs declare Apache License, Version 2.0. Actual resolved
+versions and platform variants must be taken from the consumer's graph;
+this list does not freeze or replace Maven/Gradle dependency metadata.
+
+Room's annotation processor, Gradle/AGP, and JUnit used for building or
+testing are not declared as log-record runtime API dependencies. They
+retain their own upstream licensing and are not relabeled as MIT here.
+
+3. SQLite JDBC inherited Zentus license (verbatim)
+------------------------------------------------
+Source: sqlite-jdbc-3.42.0.0.jar,
+META-INF/maven/org.xerial/sqlite-jdbc/LICENSE.zentus
+
+Copyright (c) 2006, David Crawshaw.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.

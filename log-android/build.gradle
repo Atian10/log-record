@@ -4,9 +4,21 @@
 apply plugin: 'com.android.library'
 apply plugin: 'maven-publish'
 
+// 生成目录随 buildDir 隔离；Sync 将根 MIT 文本作为声明式任务输入。
+def licenseResources = layout.buildDirectory.dir('generated/license-resources')
+def prepareLicenseResources = tasks.register('prepareLicenseResources', Sync) {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF/log-record/log-android'
+    }
+    into licenseResources
+}
+
 android {
     namespace 'com.atian10.logrecord.android'
     compileSdk 33
+
+    // Java 资源进入 AAR 的 classes.jar，使许可随消费方一起分发。
+    sourceSets.main.resources.srcDir licenseResources
 
     defaultConfig {
         minSdk 21
@@ -42,12 +54,39 @@ android {
     }
 }
 
+// AGP 7.4 的各变体先准备 Java 资源，再由其标准任务打包，普通 AS 构建同样生效。
+tasks.matching { it.name ==~ /process.*JavaRes/ }.configureEach {
+    dependsOn prepareLicenseResources
+}
+// AGP 的源码 JAR 独立于 Java 资源处理，需显式携带相同根许可证。
+tasks.withType(Jar).configureEach {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF/log-record/log-android'
+    }
+}
+
 // AGP 7.4 在配置完成后提供 Release 组件，由组件生成完整依赖元数据。
 afterEvaluate {
     publishing {
         publications {
             release(MavenPublication) {
                 from components.release
+                pom {
+                    name = 'log-record Android'
+                    description = 'Android API 21+ logging adapter using Room, built with Java 11.'
+                    url = 'https://github.com/Atian10/log-record'
+                    licenses {
+                        license {
+                            name = 'MIT License'
+                            url = 'https://opensource.org/license/mit'
+                            distribution = 'repo'
+                        }
+                    }
+                    scm {
+                        connection = 'scm:git:https://github.com/Atian10/log-record.git'
+                        url = 'https://github.com/Atian10/log-record'
+                    }
+                }
             }
         }
     }

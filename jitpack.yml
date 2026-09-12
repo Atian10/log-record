@@ -2,6 +2,12 @@
 # 构建 JDK 与五个模块的 Java 11 编译目标保持一致，Wrapper 固定 Gradle 7.5。
 jdk:
   - openjdk11
+# 只输出已知的版本身份与工具信息，不输出完整环境或任何凭据。
+before_install:
+  - 'echo "JITPACK_PROVENANCE_COMMIT=$(git rev-parse HEAD)"'
+  - 'echo "JITPACK_PROVENANCE_VERSION=$VERSION"'
+  - java -version
+  - ./gradlew --no-daemon --version
 # 仅发布三个库模块；任务在 JitPack 构建环境内写入其本地 Maven 仓库。
 install:
   - ./gradlew --no-daemon :log-core:publishToMavenLocal :log-desktop:publishToMavenLocal :log-android:publishToMavenLocal

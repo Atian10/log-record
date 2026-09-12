@@ -1,6 +1,11 @@
 #Requires -Version 7.0
 <# 仅检查本轮已生成制品；不加载应用类、不安装或运行 APK。 #>
-param([Parameter(Mandatory)][string]$RunRoot, [Parameter(Mandatory)][string]$Workspace)
+param(
+    [Parameter(Mandatory)][string]$RunRoot,
+    [Parameter(Mandatory)][string]$Workspace,
+    # Publication 只验收发布和消费产物；默认 Full 保留原完整验收范围。
+    [ValidateSet('Full','Publication')][string]$Scope = 'Full'
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $version = '0.0.0-local-validation'
@@ -20,6 +25,18 @@ function Read-ZipText($Zip, [string]$Name) {
     if (!$entry) { throw "制品缺少条目：$Name" }
     $reader = [IO.StreamReader]::new($entry.Open())
     try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function Assert-License($Zip, [string]$Module) {
+    # 一个模块只能携带一份自己的许可条目，文本必须与根许可证一致。
+    $entryName = "META-INF/log-record/$Module/LICENSE"
+    $entries = @($Zip.Entries | Where-Object { $_.FullName -ceq $entryName })
+    if ($entries.Count -ne 1) { throw "许可证条目缺失或重复：$entryName" }
+    $actualLicense = Read-ZipText $Zip $entryName
+    $rootLicense = Get-Content -LiteralPath (Join-Path $Workspace 'LICENSE') -Raw
+    if (($actualLicense -replace '\r\n', "`n") -cne ($rootLicense -replace '\r\n', "`n")) {
+        throw "分发许可与根许可证不一致：$Module"
+    }
 }
 
 function Assert-Java11Classes($Zip, [string]$Label) {
@@ -57,6 +74,17 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
     [xml]$pom = Get-Content -LiteralPath $pomPath -Raw
     if ($pom.project.groupId -ne $group -or $pom.project.artifactId -ne $module -or $pom.project.version -ne $version) {
         throw "POM 坐标不一致：$module"
+    }
+    # 除依赖坐标之外，独立分发的 POM 还应能识别项目、源码及自身许可。
+    if ([string]::IsNullOrWhiteSpace($pom.project.name) -or
+        [string]::IsNullOrWhiteSpace($pom.project.description) -or
+        $pom.project.url -ne 'https://github.com/Atian10/log-record' -or
+        $pom.project.scm.url -ne 'https://github.com/Atian10/log-record' -or
+        $pom.project.scm.connection -ne 'scm:git:https://github.com/Atian10/log-record.git' -or
+        $pom.project.licenses.license.name -ne 'MIT License' -or
+        $pom.project.licenses.license.url -ne 'https://opensource.org/license/mit' -or
+        $pom.project.licenses.license.distribution -ne 'repo') {
+        throw "POM 项目或许可信息不完整：$module"
     }
     $expected = switch ($module) {
         'log-core' { @('com.google.code.gson:gson:2.10.1:compile') }
@@ -98,13 +126,51 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
                 $classesStream.CopyTo($memoryStream)
                 $memoryStream.Position = 0
                 $classesZip = [IO.Compression.ZipArchive]::new($memoryStream, [IO.Compression.ZipArchiveMode]::Read, $true)
-                try { Assert-Java11Classes $classesZip $module } finally { $classesZip.Dispose() }
+                try {
+                    Assert-Java11Classes $classesZip $module
+                    Assert-License $classesZip $module
+                } finally { $classesZip.Dispose() }
             } finally { $memoryStream.Dispose(); $classesStream.Dispose() }
-        } else { Assert-Java11Classes $zip $module }
+        } else {
+            Assert-Java11Classes $zip $module
+            Assert-License $zip $module
+        }
     } finally { $zip.Dispose() }
     $sourceZip = [IO.Compression.ZipFile]::OpenRead($sources)
-    try { if (@($sourceZip.Entries | Where-Object { $_.FullName.EndsWith('.java') }).Count -eq 0) { throw "源码制品为空：$module" } } finally { $sourceZip.Dispose() }
-    $checks.Add([pscustomobject]@{ Check='Publication'; Module=$module; Dependencies=$actual; Sources=$sources })
+    try {
+        if (@($sourceZip.Entries | Where-Object { $_.FullName.EndsWith('.java') }).Count -eq 0) { throw "源码制品为空：$module" }
+        Assert-License $sourceZip $module
+    } finally { $sourceZip.Dispose() }
+    $checks.Add([pscustomobject]@{ Check='Publication'; Module=$module; Dependencies=$actual; Sources=$sources; License='MIT'; LicenseEntry="META-INF/log-record/$module/LICENSE" })
+}
+
+# 发布消费检查两种 Android 变体，确认 R8 打包未丢失 core/Android 的独立许可。
+foreach ($variant in @('debug','release')) {
+    $apkName = if ($variant -eq 'debug') { 'consumer-android-debug.apk' } else { 'consumer-android-release-unsigned.apk' }
+    $consumerApk = Require-File "modules/consumer-android/outputs/apk/$variant/$apkName"
+    $consumerZip = [IO.Compression.ZipFile]::OpenRead($consumerApk)
+    try {
+        if (!$consumerZip.GetEntry('AndroidManifest.xml') -or !$consumerZip.GetEntry('classes.dex')) { throw "消费 APK 内容不完整：$variant" }
+        Assert-License $consumerZip 'log-core'
+        Assert-License $consumerZip 'log-android'
+    } finally { $consumerZip.Dispose() }
+    $checks.Add([pscustomobject]@{ Check='ConsumerApkAndLicenses'; Variant=$variant; Artifact=$consumerApk })
+}
+foreach ($consumer in @('consumer-core','consumer-java')) {
+    $consumerClass = Require-File "modules/$consumer/classes/java/main/Consumer.class"
+    $checks.Add([pscustomobject]@{ Check='ConsumerCompilation'; Consumer=$consumer; Artifact=$consumerClass })
+}
+$consumerMapping = Require-File 'modules/consumer-android/outputs/mapping/release/mapping.txt'
+$consumerConfiguration = Require-File 'modules/consumer-android/outputs/mapping/release/configuration.txt'
+if ((Get-Content -LiteralPath $consumerConfiguration -Raw) -notmatch 'com\.atian10\.logrecord\.android\.room\.\*\*') {
+    throw '消费方 R8 未取得 AAR 的 Room 规则。'
+}
+$checks.Add([pscustomobject]@{ Check='ConsumerR8'; Artifact=$consumerMapping })
+
+if ($Scope -eq 'Publication') {
+    # 限定入口不伪造 Tests/Android/Lint 的完整验收结论，也不读取旧报告补齐。
+    $checks.ToArray()
+    return
 }
 
 foreach ($relative in @(

@@ -27,11 +27,34 @@ tasks.withType(JavaCompile) {
     options.release = 11
 }
 
+// 保留独立制品所需的 MIT 文本，不把依赖库合并进本模块。
+tasks.withType(Jar).configureEach {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF/log-record/log-desktop'
+    }
+}
+
 // 发布组件元数据，使消费方同时获得 core 和运行时 SQLite JDBC 依赖。
 publishing {
     publications {
         mavenJava(MavenPublication) {
             from components.java
+            pom {
+                name = 'log-record desktop'
+                description = 'Java 11 desktop and server logging adapter using SQLite JDBC.'
+                url = 'https://github.com/Atian10/log-record'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/license/mit'
+                        distribution = 'repo'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:https://github.com/Atian10/log-record.git'
+                    url = 'https://github.com/Atian10/log-record'
+                }
+            }
         }
     }
 }

@@ -1,0 +1,39 @@
+Gradle Wrapper notice
+=====================
+
+The source checkout includes the Gradle 7.5 Wrapper bootstrap files:
+  gradlew
+  gradlew.bat
+  gradle/wrapper/gradle-wrapper.jar
+  gradle/wrapper/gradle-wrapper.properties
+
+The Wrapper code and generated startup scripts are licensed under the
+Apache License, Version 2.0. See Apache-2.0.txt in this directory.
+
+Upstream copyright notices retained in the startup files include:
+  gradlew: Copyright © 2015-2021 the original authors.
+  gradlew.bat: Copyright 2015 the original author or authors.
+
+The Gradle 7.5 GradleWrapperMain.java source carries:
+  Copyright 2007 the original author or authors.
+
+These attributions identify their respective files; they do not replace
+the individual notices in other Gradle Wrapper source files.
+
+Upstream project: https://github.com/gradle/gradle
+Upstream release: https://github.com/gradle/gradle/tree/v7.5.0
+Wrapper documentation: https://docs.gradle.org/7.5/userguide/gradle_wrapper.html
+License: https://www.apache.org/licenses/LICENSE-2.0
+
+Provenance checked on 2026-09-13:
+  - This checkout's gradlew and gradlew.bat headers.
+  - The locally available Gradle 7.5 distribution source file
+    src/wrapper/org/gradle/wrapper/GradleWrapperMain.java.
+  - The locally available Gradle 7.5 distribution LICENSE.
+
+The bootstrap JAR contains Gradle wrapper, CLI and internal utility code.
+This source checkout does not vendor the complete Gradle distribution.
+The Wrapper downloads the distribution specified in its properties when
+invoked; that distribution retains its own LICENSE and NOTICE files.
+This notice does not claim that all third-party libraries from a complete
+Gradle distribution are bundled in the log-record libraries or Wrapper.
