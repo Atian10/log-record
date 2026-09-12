@@ -51,7 +51,16 @@ public final class AndroidLogInit {
     /** 数据库文件名 */
     private static final String DB_NAME = "log_record.db";
 
-    private static volatile LogDatabase database;
+    /** manager 与 Room 成对发布，旧实例关闭不会影响新实例。 */
+    private static final java.util.concurrent.atomic.AtomicReference<DatabaseOwner> owner =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private static final class DatabaseOwner {
+        /** 本次初始化的不可变资源对。 */
+        final LogManager manager;
+        final LogDatabase database;
+        /** 仅在核心初始化全部成功后构造并发布。 */
+        DatabaseOwner(LogManager manager, LogDatabase database) { this.manager = manager; this.database = database; }
+    }
 
     private AndroidLogInit() {
         // 工具类禁止实例化
@@ -83,13 +92,16 @@ public final class AndroidLogInit {
         }
         // 防重复调用：已初始化直接返回现有实例，避免重复构建 DB 导致连接泄漏
         if (LogManager.isInitialized()) {
-            return LogManager.get();
+            LogManager current = LogManager.get();
+            if (current.isClosing()) throw new IllegalStateException("previous LogManager is closing");
+            return current;
         }
         Context appContext = context.getApplicationContext();
 
         // 1. 构建数据库
         LogDatabase db = buildDatabase(appContext);
-        database = db;
+        // 候选数据库成功前不写静态 owner，失败只释放本候选。
+        try {
 
         // 2. 先从 builder 临时构建一次配置，读取 consoleEnabled 等动态配置项
         // （storage/exceptionStorage 会被覆盖，故先放占位）
@@ -119,9 +131,16 @@ public final class AndroidLogInit {
                 .exceptionStorage(exceptionStorage)
                 .consoleEnabled(false)  // Logcat 输出由装饰器处理，避免 System.out 重复输出
                 .capacityCoordinator(coordinator)
+                .databaseOwner(db.getOperationGuard(), db::close)
                 .build();
 
-        return LogManager.init(finalConfig);
+        LogManager manager = LogManager.init(finalConfig);
+        owner.set(new DatabaseOwner(manager, db));
+        return manager;
+        } catch (Throwable failure) {
+            try { db.close(); } catch (Throwable closeError) { failure.addSuppressed(closeError); }
+            throw failure;
+        }
     }
 
     /**
@@ -129,7 +148,8 @@ public final class AndroidLogInit {
      * @return 数据库实例；未初始化时返回 null
      */
     public static LogDatabase getDatabase() {
-        return database;
+        DatabaseOwner current = owner.get();
+        return current != null && !current.manager.isTerminated() ? current.database : null;
     }
 
     /**
@@ -140,56 +160,12 @@ public final class AndroidLogInit {
      * </p>
      */
     public static void shutdown() {
-        LogDatabase db = database;
-        database = null;
-        LogManager resolved = null;
-        if (LogManager.isInitialized()) {
-            try {
-                resolved = LogManager.get();
-            } catch (IllegalStateException ignored) {
-                // 并发关闭竞态：实例已被其他线程清除，无需再关闭引擎
-            }
-        }
-        // final 副本供后台关闭线程引用
-        final LogManager manager = resolved;
-        if (manager != null) {
-            manager.shutdown();
-        }
-        if (db == null) {
-            return;
-        }
-        if (manager == null || manager.isTerminated()) {
-            closeDatabase(db);
-            return;
-        }
-        // 排空超时：后台等待完全终止后再关闭数据库
-        Thread closer = new Thread(() -> {
-            while (!manager.isTerminated()) {
-                try {
-                    Thread.sleep(100L);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-            closeDatabase(db);
-        }, "log-record-db-closer");
-        closer.setDaemon(true);
-        closer.start();
+        // 捕获不可变所有者，资源关闭由该 manager 的唯一收尾者负责。
+        DatabaseOwner current = owner.get();
+        if (current == null) return;
+        current.manager.shutdown();
+        if (current.manager.isTerminated()) owner.compareAndSet(current, null);
     }
-
-    /**
-     * 关闭 Room 数据库（失败输出 logcat，不阻塞）
-     */
-    private static void closeDatabase(LogDatabase db) {
-        try {
-            db.close();
-        } catch (Throwable t) {
-            // 关闭失败不阻塞，但输出到 logcat 便于业务方诊断
-            Log.w("LogRecord", "database.close() failed: " + t.getMessage(), t);
-        }
-    }
-
     /**
      * 构建数据库
      */

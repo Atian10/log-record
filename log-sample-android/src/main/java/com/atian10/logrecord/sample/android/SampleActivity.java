@@ -319,6 +319,7 @@ public class SampleActivity extends Activity {
 
     // ===== 清理示例 =====
 
+    /** 后台执行整轮清理，分别显示表级删除量与容量维护结果。 */
     private void cleanNow() {
         // 清理含数据库删除与全库容量维护：必须离开主线程（ISSUE-06）
         backgroundExecutor.execute(() -> {
@@ -326,7 +327,9 @@ public class SampleActivity extends Activity {
                 mLogger.cleanNow(new com.atian10.logrecord.core.clean.CleanCallback() {
                     @Override
                     public void onSuccess(int cleanedCount) {
-                        postToUi(() -> appendOutput("清理完成，清理 " + cleanedCount + " 条"));
+                        com.atian10.logrecord.core.clean.CleanResult capacity = mLogger.getLastCapacityResult();
+                        postToUi(() -> appendOutput("表级清理完成，删除 " + cleanedCount + " 条"
+                                + (capacity == null ? "；容量维护未启用" : "；容量结果: " + capacity)));
                     }
 
                     @Override
@@ -352,7 +355,8 @@ public class SampleActivity extends Activity {
                 FlushResult result = mLogger.flush(FLUSH_TIMEOUT_MILLIS);
                 if (result.isAllPersisted()) {
                     postToUi(() -> appendOutput(
-                            "[" + source + "] flush 完成: 保存 " + result.getSaved() + " 条"));
+                            "[" + source + "] flush 完成: 目标累计保存 " + result.getTargetSaved()
+                                    + " 条，本次等待新增保存 " + result.getSaved() + " 条"));
                 } else {
                     postToUi(() -> appendOutput(
                             "[" + source + "] flush 未完全落盘: " + result));

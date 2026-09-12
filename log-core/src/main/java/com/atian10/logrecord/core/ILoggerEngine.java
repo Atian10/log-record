@@ -60,7 +60,7 @@ public interface ILoggerEngine {
     ShutdownResult shutdown(long timeoutMillis);
 
     /**
-     * 停止接收新记录并唤醒工作线程
+     * 停止接收新记录；工作线程在有界轮询中发现关闭，不中断在途数据库提交
      * <p>幂等。调用后 submit 被丢弃并计入告警；队列排空由工作线程负责</p>
      */
     void stopAccepting();

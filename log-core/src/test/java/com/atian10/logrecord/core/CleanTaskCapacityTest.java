@@ -20,7 +20,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * CleanTask 容量阶段集成测试（T-07 / ISSUE-05 core 部分）
  * <p>
- * 覆盖：表级清理后执行容量阶段、无预算跳过、未达标记录 lastError 且回调仍成功、
+ * 覆盖：表级清理后执行容量阶段、无预算跳过、未达标保留 lastError 且只调用失败回调、
  * 缺少协调器时记录可观察原因、getLastCapacityResult 可观察。
  * </p>
  */
@@ -59,6 +59,7 @@ public class CleanTaskCapacityTest {
         CleanTask task = new CleanTask(storage, exStorage, coordinator, () -> budget);
 
         final int[] successCount = {0};
+        final int[] failureCount = {0};
         int cleaned = task.runOnce(
                 CleanPolicy.builder().enable(true).maxRecordCount(0).build(),
                 CleanPolicy.builder().enable(false).build(),
@@ -70,7 +71,7 @@ public class CleanTaskCapacityTest {
 
                     @Override
                     public void onFailure(Throwable error) {
-                        throw new IllegalStateException("unexpected failure", error);
+                        failureCount[0]++;
                     }
                 });
 
@@ -85,7 +86,7 @@ public class CleanTaskCapacityTest {
     }
 
     @Test
-    public void runOnce_notMet_recordsLastError_butCallbackStillSucceeds() {
+    public void runOnce_notMet_recordsLastError_andFailsCallback() {
         FakeStorage storage = new FakeStorage();
         FakeExceptionStorage exStorage = new FakeExceptionStorage();
         NotMetCoordinator coordinator = new NotMetCoordinator();
@@ -93,6 +94,7 @@ public class CleanTaskCapacityTest {
                 () -> new CapacityBudget(1L, true, true));
 
         final int[] successCount = {0};
+        final int[] failureCount = {0};
         task.runOnce(CleanPolicy.builder().enable(false).build(),
                 CleanPolicy.builder().enable(false).build(),
                 new CleanCallback() {
@@ -103,15 +105,46 @@ public class CleanTaskCapacityTest {
 
                     @Override
                     public void onFailure(Throwable error) {
-                        throw new IllegalStateException("unexpected failure", error);
+                        failureCount[0]++;
                     }
                 });
 
-        assertEquals(1, successCount[0]);
+        assertEquals(0, successCount[0]);
+        assertEquals(1, failureCount[0]);
         assertEquals(CleanResult.Outcome.NOT_MET, task.getLastCapacityResult().getOutcome());
         assertTrue("lastError should describe not-met capacity",
                 task.getLastError() != null && task.getLastError().contains("NOT_MET"));
         task.shutdown(1000L);
+    }
+
+    /** 调度入口保留非 MET 状态，不清除刚发布的失败原因。 */
+    @Test public void scheduledNotMetRetainsFailure() throws Exception {
+        CleanTask task = new CleanTask(new FakeStorage(), new FakeExceptionStorage(),
+                new NotMetCoordinator(), () -> new CapacityBudget(1L, true, true));
+        try {
+            java.lang.reflect.Method run = CleanTask.class.getDeclaredMethod("cleanInternal");
+            run.setAccessible(true);
+            run.invoke(task);
+            assertTrue(task.getLastError().contains("NOT_MET"));
+            assertEquals(CleanResult.Outcome.NOT_MET, task.getLastCapacityResult().getOutcome());
+        } finally { task.shutdown(1000L); }
+    }
+
+    /** 预算解析异常不能转成成功回调；无容量结果时清空旧结果。 */
+    @Test public void budgetResolutionFailureIsReportedOnce() {
+        CleanTask task = new CleanTask(new FakeStorage(), new FakeExceptionStorage(), null,
+                () -> { throw new IllegalArgumentException("bad budget"); });
+        final int[] terminals = new int[2];
+        try {
+            task.runOnce(null, null, new CleanCallback() {
+                @Override public void onSuccess(int count) { terminals[0]++; }
+                @Override public void onFailure(Throwable error) { terminals[1]++; }
+            });
+            assertEquals(0, terminals[0]);
+            assertEquals(1, terminals[1]);
+            assertTrue(task.getLastError().contains("bad budget"));
+            assertNull(task.getLastCapacityResult());
+        } finally { task.shutdown(1000L); }
     }
 
     @Test

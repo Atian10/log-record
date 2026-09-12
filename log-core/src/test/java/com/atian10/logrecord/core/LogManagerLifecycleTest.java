@@ -18,7 +18,7 @@ import static org.junit.Assert.assertTrue;
  * 关闭结果缓存、关闭后可重新初始化。
  * </p>
  * <p>
- * 注意：LogManager 使用静态单例，本类只包含一个顺序执行的测试方法，
+ * 注意：LogManager 使用静态单例，本类各方法须顺序执行，
  * 避免与其他用例共享静态状态产生顺序依赖。
  * </p>
  */
@@ -72,6 +72,28 @@ public class LogManagerLifecycleTest {
                 LogManager.get().shutdown(2000L);
             }
         }
+    }
+
+    /** 零时限只发起关闭；活动操作归还后由后台完成，第二次调用应更新结果。 */
+    @Test public void zeroTimeoutWaitsForOperationWithoutClosingItEarly() {
+        DatabaseOperationGuard guard = new DatabaseOperationGuard();
+        java.util.concurrent.atomic.AtomicInteger closes = new java.util.concurrent.atomic.AtomicInteger();
+        LogManager manager = LogManager.init(LogConfig.builder().storage(new FakeStorage())
+                .exceptionStorage(new FakeExceptionStorage()).consoleEnabled(false)
+                .databaseOwner(guard, closes::incrementAndGet).build());
+        try {
+            try (DatabaseOperationGuard.Scope operation = guard.enter()) {
+                long started = System.nanoTime();
+                ShutdownResult pending = manager.shutdown(0L);
+                assertTrue(java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1000L);
+                assertFalse(pending.isFullyTerminated());
+                assertEquals(0, closes.get());
+            }
+            assertTrue(manager.shutdown(5000L).isFullyTerminated());
+            assertEquals(1, closes.get());
+            assertTrue(manager.shutdown(0L).isFullyTerminated());
+            assertFalse(LogManager.isInitialized());
+        } finally { manager.shutdown(5000L); }
     }
 
     /**

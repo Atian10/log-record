@@ -1,5 +1,7 @@
 package com.atian10.logrecord.core.config;
 
+import com.atian10.logrecord.core.DatabaseOperationGuard;
+
 import com.atian10.logrecord.core.IExceptionStorage;
 import com.atian10.logrecord.core.IFormatter;
 import com.atian10.logrecord.core.ILogFilter;
@@ -43,6 +45,9 @@ public final class LogConfig {
     private final long batchIntervalMillis;
     /** 全库容量协调器（平台适配层提供；null 表示无容量清理能力） */
     private final CapacityCoordinator capacityCoordinator;
+    /** 平台数据库共同所有者；关闭回调仅在全部操作退出后执行。 */
+    private final DatabaseOperationGuard databaseOperationGuard;
+    private final Runnable databaseCloser;
 
     // ===== 动态配置（可运行时修改） =====
 
@@ -83,6 +88,8 @@ public final class LogConfig {
         this.batchSize = builder.batchSize;
         this.batchIntervalMillis = builder.batchIntervalMillis;
         this.capacityCoordinator = builder.capacityCoordinator;
+        this.databaseOperationGuard = builder.databaseOperationGuard;
+        this.databaseCloser = builder.databaseCloser;
         this.consoleEnabled = builder.consoleEnabled;
         this.captureMethodLine = builder.captureMethodLine;
         this.versionTag = builder.versionTag;
@@ -125,6 +132,10 @@ public final class LogConfig {
         return capacityCoordinator;
     }
 
+    /** 返回两张表与管理器共用的操作保护。 */
+    public DatabaseOperationGuard getDatabaseOperationGuard() { return databaseOperationGuard; }
+    /** 平台资源最终关闭回调；自定义存储可不提供。 */
+    public Runnable getDatabaseCloser() { return databaseCloser; }
     public boolean isConsoleEnabled() {
         return consoleEnabled;
     }
@@ -187,6 +198,8 @@ public final class LogConfig {
         b.batchSize = source.batchSize;
         b.batchIntervalMillis = source.batchIntervalMillis;
         b.capacityCoordinator = source.capacityCoordinator;
+        b.databaseOperationGuard = source.databaseOperationGuard;
+        b.databaseCloser = source.databaseCloser;
         b.consoleEnabled = source.consoleEnabled;
         b.captureMethodLine = source.captureMethodLine;
         b.versionTag = source.versionTag;
@@ -211,7 +224,13 @@ public final class LogConfig {
      * @throws IllegalArgumentException 违反上述规则时
      */
     private static void verifyCapacityConfig(Builder builder) {
+        // 旧值也必须经过上界检查，不能因新字段未设置而提前绕过。
+        if (builder.cleanPolicy != null)
+            CapacityBudgets.checkedBytes(builder.cleanPolicy.getMaxDbSizeMB(), "cleanPolicy.maxDbSizeMB");
+        if (builder.exceptionCleanPolicy != null)
+            CapacityBudgets.checkedBytes(builder.exceptionCleanPolicy.getMaxDbSizeMB(), "exceptionCleanPolicy.maxDbSizeMB");
         Long newSizeMb = builder.databaseMaxSizeMB;
+        if (newSizeMb != null) CapacityBudgets.checkedBytes(newSizeMb, "databaseMaxSizeMB");
         if (newSizeMb == null) {
             long logOld = positiveOldCapacity(builder.cleanPolicy);
             long expOld = positiveOldCapacity(builder.exceptionCleanPolicy);
@@ -276,6 +295,9 @@ public final class LogConfig {
         private int batchSize = 100;
         private long batchIntervalMillis = 1000L;
         private CapacityCoordinator capacityCoordinator;
+        /** 平台注入自身保护；null 时由管理器创建，保持普通配置重建的兼容性。 */
+        private DatabaseOperationGuard databaseOperationGuard;
+        private Runnable databaseCloser;
         private boolean consoleEnabled = false;
         private boolean captureMethodLine = false;
         private String versionTag;
@@ -327,6 +349,13 @@ public final class LogConfig {
             return this;
         }
 
+        /** 注入数据库所有者的保护与资源释放；初始化后不可动态更换。 */
+        public Builder databaseOwner(DatabaseOperationGuard guard, Runnable closer) {
+            if (guard == null) throw new NullPointerException("guard == null");
+            this.databaseOperationGuard = guard;
+            this.databaseCloser = closer;
+            return this;
+        }
         public Builder consoleEnabled(boolean consoleEnabled) {
             this.consoleEnabled = consoleEnabled;
             return this;

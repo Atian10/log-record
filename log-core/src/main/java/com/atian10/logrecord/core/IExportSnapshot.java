@@ -1,5 +1,8 @@
 package com.atian10.logrecord.core;
 
+import com.atian10.logrecord.core.query.LogQuery;
+import com.atian10.logrecord.core.query.ExceptionQuery;
+
 import java.util.List;
 
 /**
@@ -23,7 +26,7 @@ import java.util.List;
  *
  * @param <T> 记录类型（LogRecord 或 ExceptionRecord）
  */
-public interface IExportSnapshot<T> {
+public interface IExportSnapshot<T> extends AutoCloseable {
 
     /**
      * 捕获边界内的匹配记录总数
@@ -49,7 +52,7 @@ public interface IExportSnapshot<T> {
 
     /**
      * 释放快照资源与读取保护（幂等，可多次调用）
-     * <p>关闭后调用 {@link #nextBatch(int)} 行为未定义</p>
+     * <p>快照必须在打开它的线程读取和关闭；关闭后不能继续读取。</p>
      */
     void close();
 }

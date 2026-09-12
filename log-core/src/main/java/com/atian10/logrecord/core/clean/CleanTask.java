@@ -1,5 +1,7 @@
 package com.atian10.logrecord.core.clean;
 
+import com.atian10.logrecord.core.DatabaseOperationGuard;
+
 import com.atian10.logrecord.core.IExceptionStorage;
 import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.config.CleanPolicy;
@@ -22,13 +24,20 @@ import java.util.concurrent.TimeUnit;
  *       {@link #getLastError()} 与 {@link #getLastCapacityResult()}，不虚报成功</li>
  * </ol>
  * <p>
- * 通过单线程调度器实现，避免并发清理。
+ * 定时调度使用单线程；手动与调度入口共同通过 roundLock 避免并发清理。
  * 持有 volatile 策略引用，支持运行时通过 {@link #updatePolicies} 更新策略而无需重启调度。
- * 可通过 {@link #runOnce(CleanCallback)} 立即执行一次。
+ * 可通过 {@link #runOnce(CleanPolicy, CleanPolicy, CleanCallback)} 立即执行一次。
  * </p>
  */
 public final class CleanTask {
+    /** API 21 可用的预算供应接口，避免引用 API 24 的 java.util.function。 */
+    public interface BudgetSupplier {
+        /** 返回当前预算；null 表示未启用容量维护。 */
+        CapacityBudget get();
+    }
 
+    /** 手动与定时清理共用数据库操作保护，回调在归还许可之后执行。 */
+    private final DatabaseOperationGuard operationGuard;
     private final IStorage storage;
     private final IExceptionStorage exceptionStorage;
     private final ScheduledExecutorService scheduler;
@@ -37,17 +46,30 @@ public final class CleanTask {
     /** 全库容量协调器（null 表示无容量清理能力） */
     private final CapacityCoordinator capacityCoordinator;
     /** 当前容量预算供应者（从当前配置解析；null 表示不执行容量阶段） */
-    private final java.util.function.Supplier<CapacityBudget> budgetSupplier;
+    private final BudgetSupplier budgetSupplier;
 
     /** 当前日志清理策略（volatile 保证调度线程可见性） */
     private volatile CleanPolicy logCleanPolicy;
     /** 当前异常清理策略 */
     private volatile CleanPolicy exceptionCleanPolicy;
     private volatile boolean running = false;
-    /** 最近一次调度清理的异常信息（null 表示无异常），供外部诊断 */
-    private volatile String lastError = null;
-    /** 最近一次容量维护结果（null 表示尚未执行），供外部诊断 */
-    private volatile CleanResult lastCapacityResult = null;
+    /** 手动与定时轮次串行化；用户回调和关闭等待不持有此锁。 */
+    private final Object roundLock = new Object();
+    /** 原子发布同一轮的表级计数、容量结果与错误，避免旧结果和新错误混配。 */
+    private volatile RoundResult lastRound = new RoundResult(0, null, null);
+
+    /** 不可变轮次快照；容量未执行时 result 为 null。 */
+    private static final class RoundResult {
+        final int cleaned;
+        final CleanResult capacity;
+        final Throwable failure;
+        /** 汇总整轮结果，由轮次结束后一次发布。 */
+        RoundResult(int cleaned, CleanResult capacity, Throwable failure) {
+            this.cleaned = cleaned;
+            this.capacity = capacity;
+            this.failure = failure;
+        }
+    }
 
     /**
      * 构造清理任务（无容量阶段，兼容入口）
@@ -67,13 +89,22 @@ public final class CleanTask {
      */
     public CleanTask(IStorage storage, IExceptionStorage exceptionStorage,
                      CapacityCoordinator capacityCoordinator,
-                     java.util.function.Supplier<CapacityBudget> budgetSupplier) {
+                     BudgetSupplier budgetSupplier) {
+        this(storage, exceptionStorage, capacityCoordinator, budgetSupplier,
+                new DatabaseOperationGuard());
+    }
+    /** 注入平台共同的操作保护，确保关闭等待整个清理轮次。 */
+    public CleanTask(IStorage storage, IExceptionStorage exceptionStorage,
+                     CapacityCoordinator capacityCoordinator, BudgetSupplier budgetSupplier,
+                     DatabaseOperationGuard operationGuard) {
         if (storage == null) {
             throw new NullPointerException("storage == null");
         }
         if (exceptionStorage == null) {
             throw new NullPointerException("exceptionStorage == null");
         }
+        if (operationGuard == null) throw new NullPointerException("operationGuard == null");
+        this.operationGuard = operationGuard;
         this.storage = storage;
         this.exceptionStorage = exceptionStorage;
         this.capacityCoordinator = capacityCoordinator;
@@ -176,7 +207,7 @@ public final class CleanTask {
     /**
      * 关闭清理任务并等待清理线程退出
      * <p>
-     * 停止调度后中断在执行的清理并等待其退出。超时返回 false 时清理线程可能仍在
+     * 停止调度后等待已准入清理自然退出，不中断正在提交的事务。超时返回 false 时清理线程可能仍在
      * 使用存储，调用方不应立即释放底层数据库资源，应改为轮询 {@link #isTerminated()}。
      * </p>
      * @param timeoutMillis 等待清理线程退出的时限（毫秒），负数按 0 处理
@@ -184,7 +215,7 @@ public final class CleanTask {
      */
     public boolean shutdown(long timeoutMillis) {
         stop();
-        scheduler.shutdownNow();
+        scheduler.shutdown();
         long timeout = Math.max(0L, timeoutMillis);
         try {
             return scheduler.awaitTermination(timeout, TimeUnit.MILLISECONDS);
@@ -211,111 +242,79 @@ public final class CleanTask {
      */
     public int runOnce(CleanPolicy logCleanPolicy, CleanPolicy exceptionCleanPolicy,
                        CleanCallback callback) {
-        int cleaned = 0;
-        try {
-            CleanPolicy logPolicy = logCleanPolicy == null
-                    ? CleanPolicy.builder().build() : logCleanPolicy;
-            CleanPolicy expPolicy = exceptionCleanPolicy == null
-                    ? CleanPolicy.builder().build() : exceptionCleanPolicy;
-            if (logPolicy.isEnabled()) {
-                cleaned += storage.clean(logPolicy);
-            }
-            if (expPolicy.isEnabled()) {
-                cleaned += exceptionStorage.clean(expPolicy);
-            }
-            // 全库容量阶段：在表级规则之后独立执行
-            runCapacityPhase();
-            if (callback != null) {
-                callback.onSuccess(cleaned);
-            }
-        } catch (Throwable t) {
-            if (callback != null) {
-                callback.onFailure(t);
+        RoundResult round = executeRound(logCleanPolicy, exceptionCleanPolicy);
+        // 每轮只调用一个终态；回调在存活许可归还之后执行，允许回调发起关闭。
+        if (callback != null) {
+            try {
+                if (round.failure == null) callback.onSuccess(round.cleaned);
+                else callback.onFailure(round.failure);
+            } catch (Throwable callbackError) {
+                synchronized (roundLock) {
+                    // 新轮次已经发布时，不让旧回调覆盖新轮次的诊断结果。
+                    if (lastRound == round) {
+                        IllegalStateException error = new IllegalStateException("clean callback failed", callbackError);
+                        if (round.failure != null) error.addSuppressed(round.failure);
+                        lastRound = new RoundResult(round.cleaned, round.capacity, error);
+                    }
+                }
             }
         }
-        return cleaned;
+        return round.cleaned;
     }
 
-    /**
-     * 执行清理（带策略参数，供外部主动调用）
-     * @param logCleanPolicy 日志清理策略
-     * @param exceptionCleanPolicy 异常清理策略
-     * @return 清理的记录总数
-     */
+    /** 兼容表级删除计数返回值；容量计数和结局从最近轮次结果取得。 */
     public int clean(CleanPolicy logCleanPolicy, CleanPolicy exceptionCleanPolicy) {
         return runOnce(logCleanPolicy, exceptionCleanPolicy, null);
     }
 
-    /**
-     * 定时调度的内部清理逻辑：读取当前 volatile 策略并执行清理
-     */
+    /** 调度和手动入口共用完整轮次，未达标错误不会被调度成功分支清除。 */
     private void cleanInternal() {
-        try {
-            CleanPolicy logPolicy = this.logCleanPolicy;
-            CleanPolicy expPolicy = this.exceptionCleanPolicy;
-            if (logPolicy != null && logPolicy.isEnabled()) {
-                storage.clean(logPolicy);
+        executeRound(logCleanPolicy, exceptionCleanPolicy);
+    }
+
+    /** 在串行区内完成两表规则及容量阶段，并原子发布结果。 */
+    private RoundResult executeRound(CleanPolicy logPolicy, CleanPolicy expPolicy) {
+        synchronized (roundLock) {
+            int cleaned = 0;
+            CleanResult capacity = null;
+            Throwable failure = null;
+            try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+                if (logPolicy != null && logPolicy.isEnabled()) cleaned += storage.clean(logPolicy);
+                if (expPolicy != null && expPolicy.isEnabled()) cleaned += exceptionStorage.clean(expPolicy);
+                capacity = runCapacityPhase();
+                if (capacity != null && capacity.getOutcome() != CleanResult.Outcome.MET)
+                    failure = new IllegalStateException("capacity maintenance " + capacity.getOutcome()
+                            + ": " + capacity.getStopReason());
+            } catch (Throwable error) {
+                failure = error;
             }
-            if (expPolicy != null && expPolicy.isEnabled()) {
-                exceptionStorage.clean(expPolicy);
-            }
-            // 全库容量阶段：在表级规则之后独立执行
-            runCapacityPhase();
-            // 清理成功，清除上次异常
-            lastError = null;
-        } catch (Throwable t) {
-            // 调度任务异常不应中断后续调度，但记录最近一次异常供外部诊断
-            lastError = "cleanInternal failed: " + t.getClass().getSimpleName()
-                    + ": " + t.getMessage();
+            RoundResult round = new RoundResult(cleaned, capacity, failure);
+            lastRound = round;
+            return round;
         }
     }
 
-    /**
-     * 全库容量阶段：解析当前预算并委托协调器执行
-     * <p>无预算/无协调器时静默跳过（配置缺协调器时记录可观察原因）；
-     * 未达标/推迟/失败不视为清理成功，记录到 lastError 供诊断</p>
-     */
-    private void runCapacityPhase() {
-        if (budgetSupplier == null) {
-            return;
-        }
-        final CapacityBudget budget;
-        try {
-            budget = budgetSupplier.get();
-        } catch (RuntimeException e) {
-            // 防御：配置已通过 build() 校验，此处不应出现冲突
-            lastError = "capacity budget resolve failed: " + e.getMessage();
-            return;
-        }
-        if (budget == null) {
-            return;
-        }
-        if (capacityCoordinator == null) {
-            lastError = "capacity budget present but no CapacityCoordinator configured";
-            return;
-        }
+    /** 预算解析、协调器缺失及空结果均作为失败向上传递。 */
+    private CleanResult runCapacityPhase() {
+        if (budgetSupplier == null) return null;
+        CapacityBudget budget = budgetSupplier.get();
+        if (budget == null) return null;
+        if (capacityCoordinator == null)
+            throw new IllegalStateException("capacity budget present but no CapacityCoordinator configured");
         CleanResult result = capacityCoordinator.enforceCapacity(budget);
-        lastCapacityResult = result;
-        if (result.getOutcome() != CleanResult.Outcome.MET) {
-            lastError = "capacity maintenance " + result.getOutcome()
-                    + ": " + result.getStopReason();
-        }
+        if (result == null) throw new IllegalStateException("CapacityCoordinator returned null");
+        return result;
     }
 
-    /**
-     * 获取最近一次调度清理的异常信息
-     * @return 异常描述，null 表示无异常
-     */
+    /** 最近一轮手动或调度清理的错误；null 表示该轮成功。 */
     public String getLastError() {
-        return lastError;
+        Throwable failure = lastRound.failure;
+        return failure == null ? null : failure.toString();
     }
 
-    /**
-     * 获取最近一次全库容量维护结果
-     * @return 结果；尚未执行过容量阶段时返回 null
-     */
+    /** 最近一轮容量结果；该轮未执行容量阶段时为 null。 */
     public CleanResult getLastCapacityResult() {
-        return lastCapacityResult;
+        return lastRound.capacity;
     }
 
     /**

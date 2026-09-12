@@ -1,11 +1,15 @@
 package com.atian10.logrecord.desktop;
 
+import com.atian10.logrecord.core.DatabaseOperationGuard;
+
 import com.atian10.logrecord.core.clean.CapacityBudget;
 import com.atian10.logrecord.core.clean.CapacityCoordinator;
 import com.atian10.logrecord.core.clean.CleanResult;
 import com.atian10.logrecord.desktop.jdbc.JdbcHelper;
-
 import java.io.File;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -13,225 +17,308 @@ import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * JDBC（桌面/服务器）全库容量协调器
- * <p>
- * 一个数据库只创建一个实例（由平台初始化层装配）。执行流程（修复方案 B4）：
- * </p>
- * <ol>
- *   <li>非阻塞获取两表导出保护写锁（顺序固定 log → exception）：导出快照复制期间
- *       返回 POSTPONED 推迟维护，避免先删除后才发现无法回收</li>
- *   <li>度量数据库相关文件总长；先执行 WAL checkpoint(TRUNCATE) 回收可回收空间，
- *       再决定是否删除数据</li>
- *   <li>读取实际 auto_vacuum 模式：INCREMENTAL 时执行 incremental_vacuum；
- *       空闲页足以覆盖超限量时执行 VACUUM（磁盘可用空间允许时）</li>
- *   <li>按 (timestamp, 固定表顺序 log→exception, id) 删除允许参与表中最旧的一批
- *       （每批有上限），提交后重新度量</li>
- *   <li>达标即停止；无可删数据、空间不足或工作预算耗尽时停止并报告 NOT_MET</li>
- * </ol>
- * <p>锁序与存储一致：exportGuard → helper（JdbcHelper 内部 monitor），
- * 任何持 helper 锁的路径不得再等待导出保护。</p>
+ * JDBC 全库容量维护。每批按全库顺序删除具体 ID，提交及回收都确认后才继续。
+ * 失败后的实例进入仅恢复状态；该状态不跨进程持久化，也不构成数据库硬配额。
  */
 public final class JdbcCapacityCoordinator implements CapacityCoordinator {
-
-    /** 每批删除的全局上限（跨参与表合计） */
-    private static final int DELETE_BATCH = 500;
-    /** 删除-回收循环的迭代上限（工作预算），防止无进展时持续误删 */
-    private static final int MAX_ITERATIONS = 200;
-
+    /** 两表和连接共用同一所有者及操作保护。 */
     private final JdbcHelper helper;
     private final JdbcStorage logStorage;
     private final JdbcExceptionStorage exceptionStorage;
 
-    /**
-     * 构造容量协调器
-     *
-     * @param helper 数据库连接助手（与两存储共享同一实例）
-     * @param logStorage 日志存储
-     * @param exceptionStorage 异常存储
-     */
-    public JdbcCapacityCoordinator(JdbcHelper helper, JdbcStorage logStorage,
-                                   JdbcExceptionStorage exceptionStorage) {
-        if (helper == null) {
-            throw new NullPointerException("helper == null");
-        }
-        if (logStorage == null) {
-            throw new NullPointerException("logStorage == null");
-        }
-        if (exceptionStorage == null) {
-            throw new NullPointerException("exceptionStorage == null");
-        }
+    /** 装配同一数据库的两表；调用方不得用不同连接的存储混装。 */
+    public JdbcCapacityCoordinator(JdbcHelper helper, JdbcStorage logStorage, JdbcExceptionStorage exceptionStorage) {
+        if (helper == null || logStorage == null || exceptionStorage == null)
+            throw new NullPointerException("capacity dependencies must not be null");
         this.helper = helper;
         this.logStorage = logStorage;
         this.exceptionStorage = exceptionStorage;
     }
 
+    /** 全库单批及单轮删除上限；无进展会提前停止。 */
+    private static final int DELETE_BATCH = 500;
+    private static final int MAX_ITERATIONS = 200;
+    /** 维护独占锁保护的跨轮状态；实例重建后不保留。 */
+    private boolean recoveryOnly;
+    private boolean requireSizeProgress;
+    private long blockedBytes = -1L;
+
+    /** 单轮已确认提交的删除量与最近一次可靠度量，-1 表示尚无度量。 */
+    private static final class Round {
+        int logs;
+        int exceptions;
+        long before = -1L;
+        long current = -1L;
+    }
+
+    /** 可诊断的停止原因；仅 checkpoint 忙碌属于推迟。 */
+    private static final class MaintenanceIssue extends Exception {
+        final CleanResult.Outcome outcome;
+        MaintenanceIssue(CleanResult.Outcome outcome, String message) {
+            super(message);
+            this.outcome = outcome;
+        }
+    }
+
+    /** 固定锁序：存活许可 → 日志导出写锁 → 异常导出写锁 → 维护独占锁。 */
     @Override
     public CleanResult enforceCapacity(CapacityBudget budget) {
+        if (budget == null) throw new NullPointerException("budget == null");
+        final Round round = new Round();
         final long target = budget.getBudgetBytes();
-        // 1. 非阻塞获取导出保护写锁（顺序固定 log → exception）
-        ReentrantReadWriteLock.WriteLock logLock = logStorage.exportGuard().writeLock();
-        ReentrantReadWriteLock.WriteLock expLock = exceptionStorage.exportGuard().writeLock();
-        if (!logLock.tryLock()) {
-            return result(0, 0, 0, 0, target, CleanResult.Outcome.POSTPONED,
-                    "log table snapshot copying in progress");
-        }
-        if (!expLock.tryLock()) {
-            logLock.unlock();
-            return result(0, 0, 0, 0, target, CleanResult.Outcome.POSTPONED,
-                    "exception table snapshot copying in progress");
-        }
-        long deletedLogs = 0;
-        long deletedExceptions = 0;
-        try {
-            long before = helper.getDbTotalSizeBytes();
+        try (DatabaseOperationGuard.Scope operation = helper.getOperationGuard().enter()) {
+            ReentrantReadWriteLock.WriteLock logLock = logStorage.exportGuard().writeLock();
+            ReentrantReadWriteLock.WriteLock expLock = exceptionStorage.exportGuard().writeLock();
+            if (!logLock.tryLock())
+                return result(round, target, CleanResult.Outcome.POSTPONED, "log snapshot is active");
             try {
-                long current = before;
-                boolean vacuumAttempted = false;
-                for (int i = 0; i < MAX_ITERATIONS; i++) {
-                    // 每轮度量前先合并并截断 WAL（VACUUM/删除产生的页会先落在 -wal，
-                    // 不 checkpoint 则总长不反映真实可回收状态）
-                    checkpointTruncate();
-                    current = helper.getDbTotalSizeBytes();
-                    if (current <= target) {
-                        return result((int) deletedLogs, (int) deletedExceptions,
-                                before, current, target, CleanResult.Outcome.MET, null);
-                    }
-                    // 3. 读取实际 auto_vacuum 与空闲页，优先无删除回收
-                    int autoVacuum = (int) helper.queryLong("PRAGMA auto_vacuum", null);
-                    long pageSize = helper.queryLong("PRAGMA page_size", null);
-                    long freePages = helper.queryLong("PRAGMA freelist_count", null);
-                    long freeBytes = freePages * pageSize;
-                    long excess = current - target;
-                    if (autoVacuum == 2) {
-                        // INCREMENTAL：提交增量回收后重新度量
-                        helper.executeUpdate("PRAGMA incremental_vacuum", null);
-                        continue;
-                    }
-                    if (freeBytes >= excess) {
-                        // 空闲页足以覆盖超限量：VACUUM 回收（需磁盘空间允许，约需 2 倍）
-                        File dbFile = new File(helper.getDbPath());
-                        long usable = dbFile.getParentFile() != null
-                                ? dbFile.getParentFile().getUsableSpace()
-                                : dbFile.getUsableSpace();
-                        if (usable < current) {
-                            return result((int) deletedLogs, (int) deletedExceptions,
-                                    before, current, target, CleanResult.Outcome.NOT_MET,
-                                    "insufficient disk space for VACUUM (usable=" + usable
-                                            + ", need≈" + current + ")");
-                        }
-                        helper.executeUpdate("VACUUM", null);
-                        vacuumAttempted = true;
-                        continue;
-                    }
-                    // 4. 删除参与表中最旧一批
-                    long[] deleted = deleteOldestBatch(budget);
-                    if (deleted[0] + deleted[1] == 0L) {
-                        // 无可删数据：删除产生的空闲页可能尚未实际回收，最终 VACUUM 一次
-                        if (!vacuumAttempted) {
-                            helper.executeUpdate("VACUUM", null);
-                            vacuumAttempted = true;
-                            continue;
-                        }
-                        return result((int) deletedLogs, (int) deletedExceptions,
-                                before, current, target, CleanResult.Outcome.NOT_MET,
-                                "no deletable data within eligible tables");
-                    }
-                    deletedLogs += deleted[0];
-                    deletedExceptions += deleted[1];
+                if (!expLock.tryLock())
+                    return result(round, target, CleanResult.Outcome.POSTPONED, "exception snapshot is active");
+                try (DatabaseOperationGuard.Access maintenance = helper.getOperationGuard().tryMaintenance()) {
+                    if (maintenance == null)
+                        return result(round, target, CleanResult.Outcome.POSTPONED, "database operation is active");
+                    return enforceLocked(budget, round);
+                } finally {
+                    expLock.unlock();
                 }
-                return result((int) deletedLogs, (int) deletedExceptions,
-                        before, current, target, CleanResult.Outcome.NOT_MET,
-                        "work budget exhausted");
-            } catch (SQLException e) {
-                long after = helper.getDbTotalSizeBytes();
-                return result((int) deletedLogs, (int) deletedExceptions,
-                        before, after, target, CleanResult.Outcome.FAILED,
-                        e.getClass().getSimpleName() + ": " + e.getMessage());
+            } finally {
+                logLock.unlock();
             }
-        } finally {
-            expLock.unlock();
-            logLock.unlock();
+        } catch (Exception error) {
+            return result(round, target, CleanResult.Outcome.FAILED, error.toString());
         }
     }
 
-    /**
-     * 执行 WAL checkpoint(TRUNCATE)，尽力把 WAL 内容合并回主文件
-     */
-    private void checkpointTruncate() throws SQLException {
+    /** 先无删除回收；恢复轮次绝不落入删除分支，失败及无进展均封闭后续删除。 */
+    private CleanResult enforceLocked(CapacityBudget budget, Round round) {
+        final long target = budget.getBudgetBytes();
+        final boolean recovering = recoveryOnly;
         try {
-            helper.query("PRAGMA wal_checkpoint(TRUNCATE)", null, ResultSet::next);
-        } catch (SQLException e) {
-            // checkpoint 失败不终止维护：按主文件继续度量与删除
+            round.before = measureTotalSize();
+            round.current = round.before;
+            int mode = (int) queryLong("PRAGMA auto_vacuum");
+            if (mode < 0 || mode > 2) throw new IOException("invalid auto_vacuum mode");
+            reclaim(mode);
+            round.current = measureTotalSize();
+            if (round.current <= target) {
+                recoveryOnly = false;
+                requireSizeProgress = false;
+                return result(round, target, CleanResult.Outcome.MET, null);
+            }
+            // 对可能使用 VACUUM 的模式，删除前必须证明有足够额外空间。
+            if (mode != 2) ensureVacuumSpace();
+            if (recovering) {
+                boolean recovered = !requireSizeProgress || round.current < blockedBytes;
+                if (recovered) {
+                    recoveryOnly = false;
+                    requireSizeProgress = false;
+                }
+                return result(round, target, CleanResult.Outcome.NOT_MET,
+                        recovered ? "recovery checks passed; deletion deferred to next round"
+                                  : "recovery only: no physical size progress");
+            }
+            for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+                // 记录本批前的体积，只有物理文件确实缩小时才能继续下一批。
+                long previousBytes = round.current;
+                int previousDeletes = round.logs + round.exceptions;
+                if (mode != 2) ensureVacuumSpace();
+                deleteOldestBatch(budget, round);
+                if (round.logs + round.exceptions == previousDeletes)
+                    return result(round, target, CleanResult.Outcome.NOT_MET, "no deletable data within eligible tables");
+                reclaim(mode);
+                round.current = measureTotalSize();
+                if (round.current <= target)
+                    return result(round, target, CleanResult.Outcome.MET, null);
+                if (round.current >= previousBytes) {
+                    recoveryOnly = true;
+                    requireSizeProgress = true;
+                    blockedBytes = round.current;
+                    return result(round, target, CleanResult.Outcome.NOT_MET,
+                            "no physical size progress; recovery only");
+                }
+            }
+            return result(round, target, CleanResult.Outcome.NOT_MET, "work budget exhausted");
+        } catch (Exception error) {
+            recoveryOnly = true;
+            // 保留已有的无进展门槛，临时错误不能让下轮绕过它。
+            if (!requireSizeProgress) blockedBytes = round.current;
+            round.current = -1L;
+            CleanResult.Outcome outcome = error instanceof MaintenanceIssue
+                    ? ((MaintenanceIssue) error).outcome : CleanResult.Outcome.FAILED;
+            return result(round, target, outcome, "recovery only: " + error.toString());
         }
     }
 
-    /**
-     * 删除参与表中最旧的一批（全局 (timestamp, 固定表顺序 log→exception, id) 次序）
-     *
-     * @return [日志删除数, 异常删除数]
-     */
-    private long[] deleteOldestBatch(CapacityBudget budget) throws SQLException {
-        // 全局第 N 小时间戳作为本批上界（UNION ALL LIMIT 取第 DELETE_BATCH 个）
-        StringBuilder union = new StringBuilder(96);
-        List<Object> noArgs = new ArrayList<>();
-        boolean any = false;
-        if (budget.isLogsEligible()) {
-            union.append("SELECT timestamp FROM log_record");
-            any = true;
+    /** 确认 checkpoint 后才回收；freePages=0 时继续判定是否需要删除，不空转。 */
+    private void reclaim(int mode) throws Exception {
+        checkpointTruncate();
+        long freePages = queryLong("PRAGMA freelist_count");
+        if (freePages < 0) throw new IOException("invalid freelist_count");
+        if (freePages > 0) {
+            if (mode == 2) {
+                executeMaintenance("PRAGMA incremental_vacuum(" + freePages + ")");
+            } else {
+                ensureVacuumSpace();
+                executeMaintenance("VACUUM");
+            }
         }
+        checkpointTruncate();
+    }
+
+    /** VACUUM 最多需要约两倍主文件的额外空间；未知空间按不可回收处理。 */
+    private void ensureVacuumSpace() throws Exception {
+        File dbFile = getDatabaseFile();
+        long mainBytes = checkedFileSize(dbFile, true);
+        File parent = dbFile.getAbsoluteFile().getParentFile();
+        long usable = parent == null ? 0L : parent.getUsableSpace();
+        if (mainBytes > Long.MAX_VALUE / 2 || usable < mainBytes * 2)
+            throw new MaintenanceIssue(CleanResult.Outcome.NOT_MET, "insufficient disk space for VACUUM");
+    }
+
+    /** 只接受可读取的实际文件；不把缺失、内存库或加总溢出伪装成零字节。 */
+    private long measureTotalSize() throws Exception {
+        File dbFile = getDatabaseFile();
+        long total = checkedFileSize(dbFile, true);
+        String[] suffixes = {"-wal", "-shm", "-journal"};
+        for (String suffix : suffixes) {
+            long length = checkedFileSize(new File(dbFile.getAbsolutePath() + suffix), false);
+            if (length > Long.MAX_VALUE - total) throw new IOException("database size overflow");
+            total += length;
+        }
+        return total;
+    }
+
+    /** 主文件必须存在且非空；可选边文件不存在时计零，存在却不可读时失败。 */
+    private static long checkedFileSize(File file, boolean required) throws IOException {
+        if (!file.exists() && !required) return 0L;
+        if (!file.isFile() || !file.canRead()) throw new IOException("unreadable database file: " + file);
+        long length = file.length();
+        if (required && length <= 0L) throw new IOException("empty database file: " + file);
+        return length;
+    }
+
+    /** 固定表顺序解决时间戳并列；只从允许参与的表选具体 ID。 */
+    private static String oldestSql(CapacityBudget budget) {
+        String union = budget.isLogsEligible()
+                ? "SELECT 0 AS table_order, id, timestamp FROM log_record" : "";
         if (budget.isExceptionsEligible()) {
-            if (any) {
-                union.append(" UNION ALL ");
-            }
-            union.append("SELECT timestamp FROM exception_table");
-            any = true;
+            if (!union.isEmpty()) union += " UNION ALL ";
+            union += "SELECT 1 AS table_order, id, timestamp FROM exception_table";
         }
-        if (!any) {
-            return new long[]{0L, 0L};
-        }
-        Long threshold = helper.query(
-                "SELECT timestamp FROM (" + union + ") ORDER BY timestamp LIMIT 1 OFFSET "
-                        + (DELETE_BATCH - 1),
-                noArgs.toArray(), rs -> rs.next() ? Long.valueOf(rs.getLong(1)) : null);
-        if (threshold == null) {
-            // 参与表数据量不足一批：上界取全局最大时间戳（本批可清完全部参与数据）
-            threshold = helper.query(
-                    "SELECT MAX(timestamp) FROM (" + union + ")",
-                    noArgs.toArray(), rs -> rs.next() ? Long.valueOf(rs.getLong(1)) : null);
-            if (threshold == null) {
-                return new long[]{0L, 0L};
-            }
-        }
-        long deletedLogs = 0L;
-        long deletedExceptions = 0L;
-        int remaining = DELETE_BATCH;
-        if (budget.isLogsEligible() && remaining > 0) {
-            int d = helper.executeUpdate(
-                    "DELETE FROM log_record WHERE id IN ("
-                            + "SELECT id FROM log_record WHERE timestamp <= ? "
-                            + "ORDER BY timestamp ASC, id ASC LIMIT ?)",
-                    new Object[]{threshold, remaining});
-            deletedLogs = d;
-            remaining -= d;
-        }
-        if (budget.isExceptionsEligible() && remaining > 0) {
-            int d = helper.executeUpdate(
-                    "DELETE FROM exception_table WHERE id IN ("
-                            + "SELECT id FROM exception_table WHERE timestamp <= ? "
-                            + "ORDER BY timestamp ASC, id ASC LIMIT ?)",
-                    new Object[]{threshold, remaining});
-            deletedExceptions = d;
-        }
-        return new long[]{deletedLogs, deletedExceptions};
+        return union.isEmpty() ? null : "SELECT table_order, id FROM (" + union
+                + ") ORDER BY timestamp ASC, table_order ASC, id ASC LIMIT " + DELETE_BATCH;
     }
 
-    /**
-     * 构造清理结果
-     */
-    private static CleanResult result(int deletedLogs, int deletedExceptions,
-                                      long bytesBefore, long bytesAfter, long targetBytes,
-                                      CleanResult.Outcome outcome, String stopReason) {
-        return new CleanResult(deletedLogs, deletedExceptions, bytesBefore, bytesAfter,
-                targetBytes, outcome, stopReason);
+    /** 只报告已确认提交的计数；文件度量未知使用 -1。 */
+    private static CleanResult result(Round round, long target, CleanResult.Outcome outcome, String reason) {
+        return new CleanResult(round.logs, round.exceptions, round.before, round.current, target, outcome, reason);
+    }
+
+    /** 读取实际路径；内存库没有可度量的物理预算。 */
+    private File getDatabaseFile() throws IOException {
+        String path = helper.getDbPath();
+        if (path == null || path.isEmpty() || ":memory:".equals(path))
+            throw new IOException("capacity requires a file database");
+        return new File(path);
+    }
+
+    /** 读取必须存在的 PRAGMA 单值，不以缺失行替代零。 */
+    private long queryLong(String sql) throws SQLException {
+        return helper.query(sql, null, rows -> {
+            if (!rows.next() || rows.getObject(1) == null) throw new SQLException("missing PRAGMA result: " + sql);
+            return rows.getLong(1);
+        });
+    }
+
+    /** 检查 busy/log/checkpointed 三列；非 WAL 模式允许 SQLite 的 -1/-1 返回值。 */
+    private void checkpointTruncate() throws Exception {
+        long[] values = helper.query("PRAGMA main.wal_checkpoint(TRUNCATE)", null, rows -> {
+            if (!rows.next() || rows.getMetaData().getColumnCount() < 3)
+                throw new SQLException("missing checkpoint result");
+            return new long[]{rows.getLong(1), rows.getLong(2), rows.getLong(3)};
+        });
+        if (values[0] != 0)
+            throw new MaintenanceIssue(CleanResult.Outcome.POSTPONED, "checkpoint busy");
+        if (!((values[1] == -1L && values[2] == -1L)
+                || (values[1] >= 0L && values[1] == values[2])))
+            throw new SQLException("incomplete checkpoint");
+    }
+
+    /** Xerial 普通 Statement.executeUpdate 走 sqlite3_exec，消费零列 PRAGMA 的全部步骤。 */
+    private void executeMaintenance(String sql) throws SQLException {
+        synchronized (helper) {
+            // 不能换成 PreparedStatement.executeQuery/executeUpdate：增量回收为零列多步语句。
+            try (java.sql.Statement statement = helper.getConnection().createStatement()) {
+                statement.executeUpdate(sql);
+            }
+        }
+    }
+
+    /** 选 ID 与两表删除在同一事务；commit 结果未知时关闭连接且绝不重放。 */
+    private void deleteOldestBatch(CapacityBudget budget, Round round) throws SQLException {
+        String sql = oldestSql(budget);
+        if (sql == null) return;
+        synchronized (helper) {
+            Connection connection = helper.getConnection();
+            if (!connection.getAutoCommit()) throw new SQLException("capacity requires autoCommit");
+            // 仅确认回滚或提交后才能恢复自动提交，避免恢复动作提交未知事务。
+            boolean commitStarted = false;
+            boolean committed = false;
+            boolean rolledBack = false;
+            boolean restored = false;
+            SQLException failure = null;
+            try {
+                connection.setAutoCommit(false);
+                List<Long> logs = new ArrayList<>();
+                List<Long> exceptions = new ArrayList<>();
+                try (PreparedStatement statement = connection.prepareStatement(sql);
+                     ResultSet rows = statement.executeQuery()) {
+                    while (rows.next()) {
+                        (rows.getInt(1) == 0 ? logs : exceptions).add(rows.getLong(2));
+                    }
+                }
+                int deletedLogs = deleteIds(connection, "log_record", logs);
+                int deletedExceptions = deleteIds(connection, "exception_table", exceptions);
+                commitStarted = true;
+                connection.commit();
+                committed = true;
+                round.logs += deletedLogs;
+                round.exceptions += deletedExceptions;
+            } catch (SQLException error) {
+                failure = error;
+                if (!commitStarted) {
+                    try { connection.rollback(); rolledBack = true; }
+                    catch (SQLException rollbackError) { error.addSuppressed(rollbackError); }
+                }
+            } finally {
+                if (committed || rolledBack) {
+                    try { connection.setAutoCommit(true); restored = true; }
+                    catch (SQLException restoreError) {
+                        if (failure == null) failure = restoreError;
+                        else failure.addSuppressed(restoreError);
+                    }
+                }
+                if (!restored) {
+                    try { connection.close(); }
+                    catch (SQLException closeError) {
+                        if (failure == null) failure = closeError;
+                        else failure.addSuppressed(closeError);
+                    }
+                }
+            }
+            if (failure != null) throw failure;
+        }
+    }
+
+    /** 绑定选中的 ID（最多 500 个），不再通过时间戳阈值扩大候选集合。 */
+    private static int deleteIds(Connection connection, String table, List<Long> ids) throws SQLException {
+        if (ids.isEmpty()) return 0;
+        StringBuilder sql = new StringBuilder("DELETE FROM " + table + " WHERE id IN (");
+        for (int index = 0; index < ids.size(); index++) sql.append(index == 0 ? "?" : ",?");
+        sql.append(')');
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            for (int index = 0; index < ids.size(); index++) statement.setLong(index + 1, ids.get(index));
+            return statement.executeUpdate();
+        }
     }
 }

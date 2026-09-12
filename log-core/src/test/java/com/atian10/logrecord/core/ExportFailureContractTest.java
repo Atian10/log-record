@@ -225,6 +225,60 @@ public class ExportFailureContractTest {
         assertNull(exporter.getLastCallbackError());
     }
 
+    /** count 和 close 同时失败时保留首错及 suppressed，且只发出一次失败终态。 */
+    @Test public void countAndCloseFailurePreservePrimaryError() throws Exception {
+        IllegalStateException countError = new IllegalStateException("count failed");
+        IllegalStateException closeError = new IllegalStateException("close failed");
+        AtomicInteger closed = new AtomicInteger();
+        IStorage storage = new FakeStorage() {
+            @Override public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+                return new IExportSnapshot<LogRecord>() {
+                    @Override public long getCapturedCount() { throw countError; }
+                    @Override public List<LogRecord> nextBatch(int maxRows) { throw new AssertionError("must not read"); }
+                    @Override public boolean isExhausted() { return false; }
+                    @Override public void close() { closed.incrementAndGet(); throw closeError; }
+                };
+            }
+        };
+        File target = tempDir.newFile("count-close.txt");
+        writeString(target, "ORIGINAL");
+        CountingCallback callback = new CountingCallback();
+        Exporter exporter = new Exporter(storage, new FakeExceptionStorage(), new DefaultFormatter());
+        assertEquals(0, exporter.exportLogs(LogQuery.builder().build(), ExportFormat.TXT,
+                ExportEncoding.UTF_8, target.getAbsolutePath(), callback));
+        assertEquals(1, closed.get());
+        assertEquals(1, callback.failureCount.get());
+        assertEquals(0, callback.successCount.get());
+        org.junit.Assert.assertSame(countError, callback.failure.get());
+        org.junit.Assert.assertSame(closeError, countError.getSuppressed()[0]);
+        assertEquals("ORIGINAL", readFile(target));
+        assertTrue(listExportTemps(target.getParentFile()).isEmpty());
+    }
+
+    /** 提前返回空页不能发布截短文件，即使尚无 nextBatch 异常。 */
+    @Test public void prematureEmptyPageFailsWithoutReplacingTarget() throws Exception {
+        IStorage storage = new FakeStorage() {
+            @Override public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+                return new IExportSnapshot<LogRecord>() {
+                    @Override public long getCapturedCount() { return 1L; }
+                    @Override public List<LogRecord> nextBatch(int maxRows) { return java.util.Collections.emptyList(); }
+                    @Override public boolean isExhausted() { return false; }
+                    @Override public void close() { /* 本桩无外部资源。 */ }
+                };
+            }
+        };
+        File target = tempDir.newFile("short-page.txt");
+        writeString(target, "ORIGINAL");
+        CountingCallback callback = new CountingCallback();
+        new Exporter(storage, new FakeExceptionStorage(), new DefaultFormatter()).exportLogs(
+                LogQuery.builder().build(), ExportFormat.TXT, ExportEncoding.UTF_8,
+                target.getAbsolutePath(), callback);
+        assertEquals(1, callback.failureCount.get());
+        assertEquals(0, callback.successCount.get());
+        assertEquals("ORIGINAL", readFile(target));
+        assertTrue(listExportTemps(target.getParentFile()).isEmpty());
+    }
+
     // ===== 辅助方法 =====
 
     private LogRecord record(String message) {
@@ -234,12 +288,12 @@ public class ExportFailureContractTest {
     }
 
     /**
-     * 列出目录内本次导出可能遗留的临时文件（快照与输出临时文件命名前缀）
+     * 列出目标目录中的输出临时文件；系统临时目录中的快照不由此断言覆盖
      */
     private List<File> listExportTemps(File dir) {
         File[] files = dir.listFiles((FilenameFilter) (d, name) ->
                 name.startsWith("log-record-snapshot-")
-                        || name.contains(".log-record-export-"));
+                        || name.startsWith("log-record-export-"));
         List<File> result = new ArrayList<>();
         if (files != null) {
             for (File f : files) {

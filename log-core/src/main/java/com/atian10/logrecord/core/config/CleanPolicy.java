@@ -25,7 +25,9 @@ public final class CleanPolicy {
     /** 清理周期（小时） */
     private final int cleanIntervalHours;
 
+    /** 构造前校验旧容量字段，包括暂时禁用的策略，防止后续启用溢出预算。 */
     private CleanPolicy(Builder builder) {
+        CapacityBudgets.checkedBytes(builder.maxDbSizeMB, "maxDbSizeMB");
         this.enabled = builder.enabled;
         this.keepDays = builder.keepDays;
         this.maxDbSizeMB = builder.maxDbSizeMB;

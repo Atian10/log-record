@@ -5,281 +5,220 @@ import com.atian10.logrecord.core.engine.FlushResult;
 import com.atian10.logrecord.core.engine.QueueFullPolicy;
 import com.atian10.logrecord.core.model.LogLevel;
 import com.atian10.logrecord.core.model.LogRecord;
-
 import org.junit.After;
 import org.junit.Test;
-
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import static org.junit.Assert.*;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
-/**
- * flush 等待边界测试（T-01 / ISSUE-01）
- * <p>
- * 覆盖：空闲调用立即完成、最后一批在途时不能提前返回、调用后新增记录不延长目标、
- * 写入失败与队列丢弃结束等待并计数、超时与中断结果。并发场景使用锁存器控制存储阻塞，
- * 不用 sleep 掩盖等待结果。
- * </p>
- */
+/** flush 目标、历史结果及非连续序号的回归源码；本轮未执行。 */
 public class FlushBoundaryTest {
-
-    /** 单次断言等待的通用时限（秒） */
-    private static final int AWAIT_SECONDS = 5;
-
+    /** 专用等待线程与受测引擎；每个场景在 finally 中先释放存储屏障。 */
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-
     private AsyncLoggerEngine engine;
 
-    @After
-    public void tearDown() {
-        if (engine != null) {
-            engine.shutdown(5000L);
-        }
+    /** 确保断言失败也不遗留 worker 或等待线程。 */
+    @After public void tearDown() {
+        if (engine != null) engine.shutdown(5000L);
         executor.shutdownNow();
     }
 
-    @Test
-    public void flush_idleEngine_returnsImmediatelyCompleted() {
-        FakeStorage storage = new FakeStorage();
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 100, 60000L);
-        long startNanos = System.nanoTime();
-        FlushResult result = engine.flush(5000L);
-        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-        // 空闲且无未完成记录：立即完成，不再等满超时（原缺陷为固定等待约 5 秒）
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        assertEquals(0L, result.getTargetSeq());
-        assertTrue("idle flush should return promptly, took " + elapsedMillis + "ms",
-                elapsedMillis < 2000L);
-    }
-
-    @Test
-    public void flush_lastBatchInFlight_doesNotReturnEarly() throws Exception {
-        CountDownLatch enteredWrite = new CountDownLatch(1);
-        CountDownLatch releaseWrite = new CountDownLatch(1);
-        FakeStorage storage = new FakeStorage() {
-            @Override
-            public synchronized void writeBatch(List<LogRecord> records) {
-                enteredWrite.countDown();
+    /** 第一批固定为一条，后续记录由测试在线程屏障期间一次排入。 */
+    private static class GatedStorage extends FakeStorage {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        int batches;
+        /** 第一批等待许可，后续批次可由用例定义成功、部分失败或未知。 */
+        @Override public void writeBatch(List<LogRecord> records) {
+            if (++batches == 1) {
+                entered.countDown();
                 try {
-                    releaseWrite.await();
-                } catch (InterruptedException e) {
+                    if (!release.await(5L, TimeUnit.SECONDS)) throw new IllegalStateException("gate timeout");
+                } catch (InterruptedException error) {
                     Thread.currentThread().interrupt();
+                    throw new IllegalStateException(error);
                 }
                 super.writeBatch(records);
+            } else {
+                writeLater(records);
             }
-        };
-        // batchSize=1：每条记录一批，制造"前一批版本已变、最后一批在途"的原缺陷场景
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 1, 60000L);
-        engine.submit(record("msg1"));
-        engine.submit(record("msg2"));
-        assertTrue("worker should enter first batch", enteredWrite.await(AWAIT_SECONDS, TimeUnit.SECONDS));
-        Future<FlushResult> flusher = executor.submit(() -> engine.flush(5000L));
-        // 观察窗：确认最后一批未提交时 flush 未提前返回（原缺陷此时会因版本变化而返回）
-        Thread.sleep(200);
-        assertFalse("flush must not return while last batch is uncommitted", flusher.isDone());
-        releaseWrite.countDown();
-        FlushResult result = flusher.get(AWAIT_SECONDS, TimeUnit.SECONDS);
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        assertTrue(result.isAllPersisted());
-        assertEquals(2L, result.getSaved());
-        assertEquals(2, storage.getWrittenRecords().size());
+        }
+        /** 默认后续批次正常保存。 */
+        void writeLater(List<LogRecord> records) { super.writeBatch(records); }
     }
 
-    @Test
-    public void flush_subsequentSubmissions_doNotExtendWaitTarget() throws Exception {
-        CountDownLatch enteredFirst = new CountDownLatch(1);
-        CountDownLatch releaseFirst = new CountDownLatch(1);
-        AtomicInteger batches = new AtomicInteger();
-        FakeStorage storage = new FakeStorage() {
-            @Override
-            public void writeBatch(List<LogRecord> records) {
-                if (batches.incrementAndGet() == 1) {
-                    enteredFirst.countDown();
-                    try {
-                        releaseFirst.await();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                } else {
-                    // 后续批次慢速但有限，用于观察目标边界不被晚到记录延长
-                    try {
-                        Thread.sleep(150);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                super.writeBatch(records);
-            }
-        };
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 1, 60000L);
-        engine.submit(record("msg1"));
-        assertTrue("worker should enter first batch", enteredFirst.await(AWAIT_SECONDS, TimeUnit.SECONDS));
-        Future<FlushResult> flusher = executor.submit(() -> engine.flush(5000L));
-        // 等待 flush 完成注册（注册是纯内存操作，200ms 观察窗足够），再提交晚到记录
-        Thread.sleep(200);
-        engine.submit(record("msg2"));
-        releaseFirst.countDown();
-        FlushResult result = flusher.get(AWAIT_SECONDS, TimeUnit.SECONDS);
-        // 目标固定为 1：晚到的 msg2 不属于本次等待边界
-        assertEquals(1L, result.getTargetSeq());
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        assertTrue(result.isAllPersisted());
-        assertEquals(1L, result.getSaved());
+    /** 空闲立即完成；排空后的第二次 flush 增量为零而目标累计仍保留。 */
+    @Test public void idleAndHistoricalSuccess() {
+        engine = newEngine(new FakeStorage(), 100);
+        assertTrue(engine.flush(0L).isAllPersisted());
+        engine.submit(record("first"));
+        assertTrue(engine.flush(5000L).isAllPersisted());
+        FlushResult again = engine.flush(0L);
+        assertEquals(0L, again.getSaved());
+        assertEquals(1L, again.getTargetSaved());
+        assertTrue(again.isAllPersisted());
     }
 
-    @Test
-    public void flush_writeFailure_endsWaitWithFailedCount() {
-        IStorage failing = new FakeStorage() {
-            @Override
-            public void writeBatch(List<LogRecord> records) {
-                // 模拟存储层降级后仍部分失败：3 条中保存 2 条
-                throw new BatchWriteException(records.size(), records.size() - 1, "partial failure", null);
+    /** 旧式部分汇总覆盖整个目标时可精确计数；历史失败不能被第二次 flush 掩盖。 */
+    @Test public void historicalPartialFailureIsRetained() throws Exception {
+        GatedStorage storage = new GatedStorage() {
+            @Override void writeLater(List<LogRecord> records) {
+                assertEquals(3, records.size());
+                throw new BatchWriteException(3, 2, "partial", null);
             }
         };
-        engine = newEngine(failing, new FakeExceptionStorage(), 100, 100, 60000L);
-        engine.submit(record("msg1"));
-        engine.submit(record("msg2"));
-        engine.submit(record("msg3"));
-        FlushResult result = engine.flush(5000L);
-        // 失败结束等待但不代表成功：COMPLETED 且 failed=1、saved=2
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        assertEquals(2L, result.getSaved());
-        assertEquals(1L, result.getFailed());
-        assertEquals(0L, result.getPending());
-        assertFalse(result.isAllPersisted());
+        begin(storage, 100);
+        try {
+            engine.submit(record("2"));
+            engine.submit(record("3"));
+            engine.submit(record("4"));
+            Future<FlushResult> waiting = registeredFlush();
+            storage.release.countDown();
+            FlushResult first = waiting.get(5L, TimeUnit.SECONDS);
+            assertEquals(3L, first.getTargetSaved());
+            assertEquals(1L, first.getTargetFailed());
+            assertFalse(first.isAllPersisted());
+            FlushResult again = engine.flush(0L);
+            assertEquals(0L, again.getFailed());
+            assertEquals(1L, again.getTargetFailed());
+            assertFalse(again.isAllPersisted());
+        } finally { storage.release.countDown(); }
     }
 
-    @Test
-    public void flush_droppedRecord_endsWaitWithDroppedCount() throws Exception {
-        CountDownLatch enteredFirst = new CountDownLatch(1);
-        CountDownLatch releaseFirst = new CountDownLatch(1);
-        FakeStorage storage = new FakeStorage() {
-            @Override
-            public synchronized void writeBatch(List<LogRecord> records) {
-                enteredFirst.countDown();
-                try {
-                    releaseFirst.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                super.writeBatch(records);
+    /** 普通异常没有未提交证据，必须保留 UNKNOWN。 */
+    @Test public void unclassifiedWriteFailureRemainsUnknown() {
+        engine = newEngine(new FakeStorage() {
+            @Override public void writeBatch(List<LogRecord> records) { throw new IllegalStateException("unknown commit"); }
+        }, 100);
+        engine.submit(record("unknown"));
+        FlushResult first = engine.flush(5000L);
+        assertEquals(1L, first.getTargetUnknown());
+        assertEquals(0L, first.getTargetFailed());
+        assertFalse(engine.flush(0L).isAllPersisted());
+    }
+
+    /** DROP_OLDEST 制造 seq2 空洞；逐条结果必须匹配 seq3/seq4，不能二次终结 seq2。 */
+    @Test public void holesAndPerItemOutcomesAreCountedExactlyOnce() throws Exception {
+        GatedStorage storage = new GatedStorage() {
+            @Override void writeLater(List<LogRecord> records) {
+                assertEquals(2, records.size());
+                throw new BatchWriteException(new BatchWriteException.ItemOutcome[]{
+                        BatchWriteException.ItemOutcome.SAVED, BatchWriteException.ItemOutcome.FAILED}, "items", null);
             }
         };
-        // 队列容量 1：msg2 入队后 msg3 触发 DROP_OLDEST 丢弃 msg2
-        engine = newEngine(storage, new FakeExceptionStorage(), 1, 1, 60000L);
-        engine.submit(record("msg1"));
-        assertTrue("worker should enter first batch", enteredFirst.await(AWAIT_SECONDS, TimeUnit.SECONDS));
-        engine.submit(record("msg2"));
-        // 先注册等待（目标 2），再触发丢弃，使丢弃计入等待期间的终态统计
-        Future<FlushResult> flusher = executor.submit(() -> engine.flush(5000L));
-        Thread.sleep(200);
-        engine.submit(record("msg3"));
-        releaseFirst.countDown();
-        FlushResult result = flusher.get(AWAIT_SECONDS, TimeUnit.SECONDS);
-        // 目标 2 条全部终态：seq1 保存 + seq2 丢弃；seq3 晚于目标不计入
-        assertEquals(2L, result.getTargetSeq());
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        assertEquals(1L, result.getDropped());
-        assertEquals(1L, result.getSaved());
-        assertFalse(result.isAllPersisted());
-        assertEquals(2, storage.getWrittenRecords().size());
+        begin(storage, 2);
+        try {
+            engine.submit(record("drop-2"));
+            engine.submit(record("saved-3"));
+            engine.submit(record("failed-4"));
+            storage.release.countDown();
+            FlushResult result = engine.flush(5000L);
+            assertEquals(4L, result.getTargetSeq());
+            assertEquals(2L, result.getTargetSaved());
+            assertEquals(1L, result.getTargetFailed());
+            assertEquals(1L, result.getTargetDropped());
+            assertEquals(0L, result.getPending());
+            assertFalse(engine.flush(0L).isAllPersisted());
+        } finally { storage.release.countDown(); }
     }
 
-    @Test
-    public void flush_timeout_reportsPending() throws Exception {
-        CountDownLatch enteredWrite = new CountDownLatch(1);
-        CountDownLatch releaseWrite = new CountDownLatch(1);
-        FakeStorage storage = new FakeStorage() {
-            @Override
-            public synchronized void writeBatch(List<LogRecord> records) {
-                enteredWrite.countDown();
-                try {
-                    releaseWrite.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                super.writeBatch(records);
+    /** 旧式部分汇总跨过当前 flush 目标时，目标子集无法归属，按 UNKNOWN 返回。 */
+    @Test public void partialAggregateStraddlingTargetIsUnknown() throws Exception {
+        GatedStorage storage = new GatedStorage() {
+            @Override void writeLater(List<LogRecord> records) {
+                assertEquals(3, records.size());
+                throw new BatchWriteException(3, 2, "partial", null);
             }
         };
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 100, 60000L);
-        engine.submit(record("msg1"));
-        assertTrue("worker should enter batch", enteredWrite.await(AWAIT_SECONDS, TimeUnit.SECONDS));
-        FlushResult result = engine.flush(100L);
-        assertEquals(FlushResult.Outcome.TIMEOUT, result.getOutcome());
-        assertEquals(1L, result.getPending());
-        // 释放阻塞让 tearDown 的 shutdown 可以完成排空
-        releaseWrite.countDown();
+        begin(storage, 100);
+        try {
+            engine.submit(record("2"));
+            engine.submit(record("3"));
+            Future<FlushResult> waiting = registeredFlush();
+            engine.submit(record("after-target"));
+            storage.release.countDown();
+            FlushResult result = waiting.get(5L, TimeUnit.SECONDS);
+            assertEquals(3L, result.getTargetSeq());
+            assertEquals(1L, result.getTargetSaved());
+            assertEquals(2L, result.getTargetUnknown());
+            assertEquals(0L, result.getPending());
+            assertFalse(result.isAllPersisted());
+        } finally { storage.release.countDown(); }
     }
 
-    @Test
-    public void flush_interrupted_returnsInterruptedOutcome() throws Exception {
-        CountDownLatch enteredWrite = new CountDownLatch(1);
-        CountDownLatch releaseWrite = new CountDownLatch(1);
-        FakeStorage storage = new FakeStorage() {
-            @Override
-            public synchronized void writeBatch(List<LogRecord> records) {
-                enteredWrite.countDown();
-                try {
-                    releaseWrite.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                super.writeBatch(records);
-            }
-        };
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 100, 60000L);
-        engine.submit(record("msg1"));
-        assertTrue("worker should enter batch", enteredWrite.await(AWAIT_SECONDS, TimeUnit.SECONDS));
-        final java.util.concurrent.atomic.AtomicReference<FlushResult> outcome =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        Thread flusher = new Thread(() -> outcome.set(engine.flush(10000L)), "flush-interrupt-test");
-        flusher.start();
-        Thread.sleep(200);
-        // 中断等待线程：应返回 INTERRUPTED 结果并恢复中断标志，而不是继续等待
-        flusher.interrupt();
-        flusher.join(5000);
-        releaseWrite.countDown();
-        FlushResult result = outcome.get();
-        assertEquals(FlushResult.Outcome.INTERRUPTED, result.getOutcome());
-        assertEquals(1L, result.getPending());
-    }
-
-    @Test
-    public void flush_afterShutdownDrain_returnsCompletedForAcceptedRecords() throws Exception {
-        FakeStorage storage = new FakeStorage();
-        engine = newEngine(storage, new FakeExceptionStorage(), 100, 100, 60000L);
-        engine.submit(record("msg1"));
-        // 关闭排空后，flush 对已接收记录立即给出终态结果
+    /** 在途写入不提前完成；零时限关闭立即返回，之后自然排空。 */
+    @Test public void pendingFlushAndZeroShutdownAreBounded() throws Exception {
+        GatedStorage storage = new GatedStorage();
+        begin(storage, 100);
+        try {
+            FlushResult pending = engine.flush(0L);
+            assertEquals(FlushResult.Outcome.TIMEOUT, pending.getOutcome());
+            assertEquals(1L, pending.getPending());
+            long started = System.nanoTime();
+            engine.shutdown(0L);
+            assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1000L);
+            assertFalse(engine.isTerminated());
+        } finally { storage.release.countDown(); }
         engine.shutdown(5000L);
-        FlushResult result = engine.flush(1000L);
-        assertEquals(FlushResult.Outcome.COMPLETED, result.getOutcome());
-        // msg1 在本次调用前已由排空保存：计入 alreadyFinalized 而非 saved
-        assertEquals(1L, result.getAlreadyFinalized());
-        assertEquals(0L, result.getSaved());
-        assertEquals(0L, result.getPending());
-        assertTrue(result.isAllPersisted());
-        assertEquals(1, storage.getWrittenRecords().size());
+        assertTrue(engine.isTerminated());
+        assertTrue(engine.flush(0L).isAllPersisted());
     }
 
-    // ===== 辅助方法 =====
-
-    private AsyncLoggerEngine newEngine(IStorage storage, IExceptionStorage exStorage,
-                                        int queueCapacity, int batchSize, long batchInterval) {
-        return new AsyncLoggerEngine(storage, exStorage, queueCapacity,
-                QueueFullPolicy.DROP_OLDEST, batchSize, batchInterval);
+    /** 中断等待返回 INTERRUPTED，保持中断标志且不改变目标记录状态。 */
+    @Test public void interruptedWaitDoesNotFinalizeRecords() throws Exception {
+        GatedStorage storage = new GatedStorage();
+        begin(storage, 100);
+        try {
+            Thread.currentThread().interrupt();
+            FlushResult result = engine.flush(5000L);
+            assertEquals(FlushResult.Outcome.INTERRUPTED, result.getOutcome());
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertEquals(1L, result.getPending());
+        } finally {
+            Thread.interrupted();
+            storage.release.countDown();
+        }
     }
 
-    private LogRecord record(String msg) {
-        return new LogRecord(1L, LogLevel.INFO, "T", "tag",
-                Thread.currentThread().getName(), Thread.currentThread().getId(),
-                null, 0, null, false, msg, null);
+    /** 启动一条在途记录，让后续批次的集合不依赖线程调度概率。 */
+    private void begin(GatedStorage storage, int capacity) throws Exception {
+        engine = newEngine(storage, capacity);
+        engine.submit(record("first"));
+        assertTrue(storage.entered.await(5L, TimeUnit.SECONDS));
+    }
+
+    /** 只观察已注册等待者；不修改私有状态，不用固定 sleep 猜测注册时间。 */
+    private Future<FlushResult> registeredFlush() throws Exception {
+        Field lockField = AsyncLoggerEngine.class.getDeclaredField("flushLock");
+        Field waitersField = AsyncLoggerEngine.class.getDeclaredField("waiters");
+        lockField.setAccessible(true);
+        waitersField.setAccessible(true);
+        Object lock = lockField.get(engine);
+        Future<FlushResult> future = executor.submit(() -> engine.flush(5000L));
+        long started = System.nanoTime();
+        while (System.nanoTime() - started < TimeUnit.SECONDS.toNanos(5L)) {
+            synchronized (lock) {
+                if (!((List<?>) waitersField.get(engine)).isEmpty()) return future;
+            }
+            Thread.yield();
+        }
+        throw new AssertionError("flush waiter was not registered");
+    }
+
+    /** 使用足够大的批次上限，第一条屏障期间排入的记录会作为完整一批取出。 */
+    private AsyncLoggerEngine newEngine(IStorage storage, int capacity) {
+        return new AsyncLoggerEngine(storage, new FakeExceptionStorage(), capacity,
+                QueueFullPolicy.DROP_OLDEST, 100, 60000L);
+    }
+
+    /** 最小日志记录。 */
+    private LogRecord record(String message) {
+        return new LogRecord(1L, LogLevel.INFO, "T", "tag", "test", 1L,
+                null, 0, null, false, message, null);
     }
 }

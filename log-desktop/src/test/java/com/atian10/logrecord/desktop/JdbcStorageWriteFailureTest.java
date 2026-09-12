@@ -28,7 +28,7 @@ import static org.junit.Assert.fail;
  * <p>
  * 使用测试专属临时真实 SQLite 数据库，通过触发器注入批量失败：
  * 确认回滚的事务被逐条重放并如实上报保存/失败数量，且不产生重复记录；
- * 连接关闭（提交结果不确定路径）时禁止自动重放，整体按失败上报。
+ * 关闭后拒绝准入；提交未知不重放；提交后清理失败仍报告 SAVED。
  * </p>
  */
 public class JdbcStorageWriteFailureTest {
@@ -110,35 +110,100 @@ public class JdbcStorageWriteFailureTest {
         assertEquals(2L, storage.getRecordCount());
     }
 
-    @Test
-    public void write_withClosedHelper_propagatesFailure() throws Exception {
+    /** 关闭后在进入 SQL 之前拒绝，不作为已尝试的写入结果。 */
+    @Test public void closedHelperRejectsNewWrites() {
         helper.close();
         try {
             storage.write(logRecord("after-close"));
-            fail("expected BatchWriteException for closed helper");
-        } catch (BatchWriteException e) {
-            assertEquals(1, e.getAttempted());
-            assertEquals(0, e.getSaved());
-        }
-        // 兼容入口保持静默（由引擎容错），不再单独断言
+            fail("closed guard must reject");
+        } catch (IllegalStateException expected) { assertTrue(expected.getMessage().contains("closing")); }
+        try {
+            storage.writeBatch(java.util.Collections.singletonList(logRecord("after-close")));
+            fail("closed guard must reject batch");
+        } catch (IllegalStateException expected) { assertTrue(expected.getMessage().contains("closing")); }
     }
 
-    @Test
-    public void writeBatch_withClosedHelper_reportsUncertainWithoutReplay() throws Exception {
-        helper.close();
-        List<LogRecord> records = new ArrayList<>();
-        records.add(logRecord("u1"));
-        records.add(logRecord("u2"));
-        records.add(logRecord("u3"));
+    /** commit 已完成而 statement.close 失败，仍按已保存上报且不再次插入。 */
+    @Test public void committedBatchWithCloseFailureIsSavedWithoutReplay() throws Exception {
+        injectConnectionFailure("statementClose");
         try {
-            storage.writeBatch(records);
-            fail("expected BatchWriteException for closed helper");
-        } catch (BatchWriteException e) {
-            // 提交结果不确定（含连接不可用）：整批失败、saved=0，禁止自动重放
-            assertEquals(3, e.getAttempted());
-            assertEquals(0, e.getSaved());
-            assertTrue(e.getMessage(), e.getMessage().contains("uncertain"));
+            storage.writeBatch(java.util.Arrays.asList(logRecord("one"), logRecord("two")));
+            fail("cleanup error should remain observable");
+        } catch (BatchWriteException error) {
+            assertEquals(2, error.getSaved());
+            for (BatchWriteException.ItemOutcome item : error.getItemOutcomes())
+                assertEquals(BatchWriteException.ItemOutcome.SAVED, item);
         }
+        assertEquals(2L, storage.getRecordCount());
+    }
+
+    /** commit 返回前抛错即属未知；隔离连接，禁止回滚和恢复自动提交造成误重放。 */
+    @Test public void uncertainCommitIsNotRolledBackOrReplayed() throws Exception {
+        List<String> calls = injectConnectionFailure("commit");
+        try {
+            storage.writeBatch(java.util.Arrays.asList(logRecord("one"), logRecord("two")));
+            fail("commit failure must be observable");
+        } catch (BatchWriteException error) {
+            assertEquals(0, error.getSaved());
+            for (BatchWriteException.ItemOutcome item : error.getItemOutcomes())
+                assertEquals(BatchWriteException.ItemOutcome.UNKNOWN, item);
+        }
+        assertEquals(1, java.util.Collections.frequency(calls, "commit"));
+        assertEquals(0, java.util.Collections.frequency(calls, "rollback"));
+        assertEquals(0, java.util.Collections.frequency(calls, "autoCommit:true"));
+        assertEquals(1, java.util.Collections.frequency(calls, "close"));
+    }
+
+    /** 自动提交恢复失败不抹掉已提交证据，同时连接不得继续复用。 */
+    @Test public void committedBatchWithRestoreFailureRemainsSaved() throws Exception {
+        List<String> calls = injectConnectionFailure("restore");
+        try {
+            storage.writeBatch(java.util.Collections.singletonList(logRecord("one")));
+            fail("restore failure must be observable");
+        } catch (BatchWriteException error) {
+            assertEquals(1, error.getSaved());
+            assertEquals(BatchWriteException.ItemOutcome.SAVED, error.getItemOutcomes()[0]);
+        }
+        assertEquals(1, java.util.Collections.frequency(calls, "commit"));
+        assertEquals(1, java.util.Collections.frequency(calls, "close"));
+    }
+
+    /** 在真实测试连接外包一层故障代理；仅测试源码使用反射注入，不改生产接口。 */
+    private List<String> injectConnectionFailure(String phase) throws Exception {
+        java.sql.Connection original = helper.getConnection();
+        List<String> calls = new ArrayList<>();
+        java.sql.Connection proxy = (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
+                java.sql.Connection.class.getClassLoader(), new Class<?>[]{java.sql.Connection.class},
+                (ignored, method, args) -> {
+                    String name = method.getName();
+                    if ("commit".equals(name) || "rollback".equals(name) || "close".equals(name)) calls.add(name);
+                    if ("setAutoCommit".equals(name)) calls.add("autoCommit:" + args[0]);
+                    if ("commit".equals(name) && "commit".equals(phase))
+                        throw new SQLException("injected uncertain commit");
+                    if ("setAutoCommit".equals(name) && Boolean.TRUE.equals(args[0]) && "restore".equals(phase))
+                        throw new SQLException("injected restore failure");
+                    try {
+                        Object value = method.invoke(original, args);
+                        if ("prepareStatement".equals(name) && "statementClose".equals(phase)
+                                && ((String) args[0]).startsWith("INSERT")) {
+                            java.sql.PreparedStatement statement = (java.sql.PreparedStatement) value;
+                            return java.lang.reflect.Proxy.newProxyInstance(
+                                    java.sql.PreparedStatement.class.getClassLoader(),
+                                    new Class<?>[]{java.sql.PreparedStatement.class}, (target, operation, parameters) -> {
+                                        try {
+                                            Object result = operation.invoke(statement, parameters);
+                                            if ("close".equals(operation.getName())) throw new SQLException("injected statement close");
+                                            return result;
+                                        } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                                    });
+                        }
+                        return value;
+                    } catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                });
+        java.lang.reflect.Field connectionField = JdbcHelper.class.getDeclaredField("connection");
+        connectionField.setAccessible(true);
+        connectionField.set(helper, proxy);
+        return calls;
     }
 
     @Test

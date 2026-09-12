@@ -67,6 +67,20 @@ public class UserFieldQueryJdbcTest {
         storage.writeBatch(records);
     }
 
+    /** 键内的转义引号不能让键后缀伪装成独立 JSON 成员。 */
+    @Test public void escapedKeySuffixDoesNotMatchBareMember() {
+        storage.write(record("prefix\\\"key", "value", null));
+        storage.write(record("prefix,\\\"key", "value", null));
+        assertUserFieldCount(0, "key", "value");
+        LogQuery negative = LogQuery.builder().userField("key", "value").build();
+        assertEquals(0L, storage.statistics(negative).getTotalCount());
+        try (com.atian10.logrecord.core.IExportSnapshot<LogRecord> snapshot = storage.openExportSnapshot(negative)) {
+            assertEquals(0L, snapshot.getCapturedCount());
+            assertEquals(0, snapshot.nextBatch(10).size());
+        }
+        assertUserFieldCount(1, "prefix\\\"key", "value");
+    }
+
     @Test
     public void query_plainValue_matchesExactlyOneRow() {
         assertUserFieldCount(1, "plain", "value");

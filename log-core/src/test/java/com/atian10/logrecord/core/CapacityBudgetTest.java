@@ -148,6 +148,28 @@ public class CapacityBudgetTest {
         }
     }
 
+    /** 旧值即使策略禁用也必须先验证范围，且精确接受最大可转换值。 */
+    @Test public void legacyRangeIsCheckedBeforeEligibility() {
+        long maximum = Long.MAX_VALUE / MB;
+        for (boolean enabled : new boolean[]{false, true}) {
+            assertEquals(maximum, policy(enabled, maximum).getMaxDbSizeMB());
+            for (long invalid : new long[]{-1L, maximum + 1L, Long.MAX_VALUE}) {
+                try {
+                    policy(enabled, invalid);
+                    fail("legacy range must be rejected: " + invalid);
+                } catch (IllegalArgumentException expected) { /* 范围校验命中。 */ }
+            }
+        }
+        assertEquals(maximum * MB, CapacityBudgets.resolve(baseConfig()
+                .cleanPolicy(policy(true, maximum)).build()).getBudgetBytes());
+        for (long invalid : new long[]{0L, -1L}) {
+            try {
+                new CapacityBudget(invalid, true, true);
+                fail("resolved budget must be positive");
+            } catch (IllegalArgumentException expected) { /* 解析后的预算必须为正。 */ }
+        }
+    }
+
     @Test
     public void noBudgetAnywhere_resolvesNull() {
         LogConfig config = baseConfig()
@@ -170,7 +192,6 @@ public class CapacityBudgetTest {
             // 期望异常：CAS 前构建失败，原配置保持
         }
         assertSame(original, updater.get());
-        assertNull(updater.get().getExceptionCleanPolicy().getMaxDbSizeMB() == 0L ? null : null);
         assertEquals(0L, updater.get().getExceptionCleanPolicy().getMaxDbSizeMB());
     }
 

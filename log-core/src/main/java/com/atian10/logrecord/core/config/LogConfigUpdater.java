@@ -67,13 +67,17 @@ public final class LogConfigUpdater {
 
     /**
      * 校验静态配置项不可变
-     * <p>检查 6 项静态配置（storage/exceptionStorage/queueCapacity/queueFullPolicy/
+     * <p>检查存储、队列及数据库所有者等静态配置（storage/exceptionStorage/queueCapacity/queueFullPolicy/
      * batchSize/batchIntervalMillis）是否与当前配置一致，不一致抛异常</p>
      * @param current 当前生效配置
      * @param candidate 待替换配置
      * @throws IllegalArgumentException 当任一静态配置项不一致时
      */
     private void verifyStaticConfigUnchanged(LogConfig current, LogConfig candidate) {
+        if (current.getDatabaseOperationGuard() != candidate.getDatabaseOperationGuard()
+                || current.getDatabaseCloser() != candidate.getDatabaseCloser()) {
+            throw new IllegalArgumentException("database owner cannot be changed via set()");
+        }
         if (current.getStorage() != candidate.getStorage()) {
             throw new IllegalArgumentException(
                     "storage cannot be changed via set(); re-init LogManager instead");

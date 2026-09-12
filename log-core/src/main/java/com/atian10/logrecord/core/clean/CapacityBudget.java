@@ -25,6 +25,7 @@ public final class CapacityBudget {
      * @param exceptionsEligible 异常表是否允许参与容量删除
      */
     public CapacityBudget(long budgetBytes, boolean logsEligible, boolean exceptionsEligible) {
+        if (budgetBytes <= 0L) throw new IllegalArgumentException("budgetBytes must be positive");
         this.budgetBytes = budgetBytes;
         this.logsEligible = logsEligible;
         this.exceptionsEligible = exceptionsEligible;

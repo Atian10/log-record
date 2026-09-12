@@ -8,7 +8,7 @@ import com.atian10.logrecord.core.model.LogRecord;
  * 日志格式化接口
  * <p>
  * 仅用于导出时格式化。写入时分列存储不需要 Formatter。
- * 实现方可自定义格式，抛异常时降级用原始内容。
+ * 实现方可自定义格式；抛异常时整次导出失败，保留原目标文件并报告失败回调。
  * </p>
  */
 public interface IFormatter {

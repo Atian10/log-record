@@ -1,5 +1,7 @@
 package com.atian10.logrecord.desktop;
 
+import com.atian10.logrecord.core.DatabaseOperationGuard;
+
 import com.atian10.logrecord.core.BatchWriteException;
 import com.atian10.logrecord.core.ExportSnapshotException;
 import com.atian10.logrecord.core.IExportSnapshot;
@@ -30,16 +32,18 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * 实现 {@link IStorage}，将日志持久化到 SQLite。
  * 动态查询通过 SQL 拼接 + PreparedStatement 参数化实现，防 SQL 注入。
  * user_fields 的键值对查询按与写入一致的规范 JSON 成员片段，
- * 用参数化 {@code instr} 子串匹配（大小写敏感）。
+ * 以两侧逗号包围完整成员，再用参数化 {@code instr} 匹配（大小写敏感）。
  * </p>
  */
 public final class JdbcStorage implements IStorage {
+    /** 同一数据库的操作许可，覆盖复合访问及整个导出快照。 */
+    private final DatabaseOperationGuard operationGuard;
 
     private final JdbcHelper helper;
 
     /**
      * 导出读取保护：快照复制持读锁，清理持写锁互斥
-     * <p>锁序固定为 exportGuard → helper（JdbcHelper 内部 monitor），
+     * <p>锁序固定为操作许可 → exportGuard → 维护锁 → helper（连接 monitor），
      * 任何持 helper 锁的路径不得再等待本锁，避免死锁</p>
      */
     private final ReentrantReadWriteLock exportGuard = new ReentrantReadWriteLock();
@@ -53,10 +57,18 @@ public final class JdbcStorage implements IStorage {
             throw new NullPointerException("helper == null");
         }
         this.helper = helper;
+        this.operationGuard = helper.getOperationGuard();
     }
 
     @Override
     public void write(LogRecord record) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            writeInternal(record);
+        }
+    }
+    /** 在存活许可内转换并写入单条记录，错误由原存储契约上报。 */
+    private void writeInternal(LogRecord record) {
         if (record == null) {
             return;
         }
@@ -64,12 +76,19 @@ public final class JdbcStorage implements IStorage {
             helper.executeUpdate(LogTableSchema.INSERT_LOG, toArgs(record));
         } catch (SQLException e) {
             // 写入失败必须向引擎传递，禁止静默吞掉（ISSUE-02）
-            throw new BatchWriteException(1, 0, "log write failed: " + e.getMessage(), e);
+            throw new BatchWriteException(outcomes(1, e), "log write failed: " + e.getMessage(), e);
         }
     }
 
     @Override
     public void writeBatch(List<LogRecord> records) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            writeBatchInternal(records);
+        }
+    }
+    /** 在同一外层存活许可内提交整批，保留逐条或事务级结果。 */
+    private void writeBatchInternal(List<LogRecord> records) {
         if (records == null || records.isEmpty()) {
             return;
         }
@@ -82,30 +101,54 @@ public final class JdbcStorage implements IStorage {
         } catch (BatchRolledBackException e) {
             // 事务已确认回滚：由本存储层执行唯一的降级重放（逐条），引擎不再叠加重试
             int saved = 0;
+            // 按原输入下标保留重放结果，目标切分时仍能准确归属。
+            BatchWriteException.ItemOutcome[] itemResults = new BatchWriteException.ItemOutcome[records.size()];
+            int itemIndex = 0;
             SQLException lastFailure = null;
             for (LogRecord r : records) {
                 try {
                     helper.executeUpdate(LogTableSchema.INSERT_LOG, toArgs(r));
                     saved++;
+                    itemResults[itemIndex] = BatchWriteException.ItemOutcome.SAVED;
                 } catch (SQLException ex) {
                     lastFailure = ex;
+                    itemResults[itemIndex] = outcomes(1, ex)[0];
+                    if (itemResults[itemIndex] == BatchWriteException.ItemOutcome.SAVED) saved++;
                 }
+                itemIndex++;
             }
-            if (saved < records.size()) {
-                throw new BatchWriteException(records.size(), saved,
+            if (saved < records.size() || lastFailure != null) {
+                throw new BatchWriteException(itemResults,
                         "log batch replay partially failed: saved " + saved + "/"
                                 + records.size(),
                         lastFailure != null ? lastFailure : e);
             }
         } catch (SQLException e) {
-            // 提交结果不确定或回滚失败：禁止自动重放，整批按失败上报
-            throw new BatchWriteException(records.size(), 0,
+            // 提交结果不确定或回滚失败：禁止自动重放，保留 SAVED/FAILED/UNKNOWN 的事务结果
+            throw new BatchWriteException(outcomes(records.size(), e),
                     "log batch outcome uncertain, replay disabled: " + e.getMessage(), e);
         }
     }
 
+    /** 将 JDBC 明确结果复制到本次输入；普通 SQL 异常保守标记 UNKNOWN。 */
+    private static BatchWriteException.ItemOutcome[] outcomes(int count, SQLException failure) {
+        // 同一事务的全部条目共享已确认结果；逐条重放则以 count=1 单独记录。
+        BatchWriteException.ItemOutcome outcome = failure instanceof JdbcHelper.WriteOutcomeException
+                ? ((JdbcHelper.WriteOutcomeException) failure).getOutcome()
+                : BatchWriteException.ItemOutcome.UNKNOWN;
+        BatchWriteException.ItemOutcome[] results = new BatchWriteException.ItemOutcome[count];
+        java.util.Arrays.fill(results, outcome);
+        return results;
+    }
     @Override
     public List<LogRecord> query(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return queryInternal(query);
+        }
+    }
+    /** 在存活许可内完成查询及实体转换，使用原查询的错误兼容语义。 */
+    private List<LogRecord> queryInternal(LogQuery query) {
         if (query == null) {
             return new ArrayList<>();
         }
@@ -129,6 +172,13 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public LogStatistics statistics(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return statisticsInternal(query);
+        }
+    }
+    /** 在一个存活许可内完成总数和分组查询，避免关闭切入子查询之间。 */
+    private LogStatistics statisticsInternal(LogQuery query) {
         // 复用 count(query) 保证 total 与 WHERE 条件一致；
         // 三个维度（level/type/tag）通过 buildGroupBySql 拼接 GROUP BY 聚合 SQL，
         // 复用 appendWhereClause 保证 WHERE 条件与 query 一致。
@@ -192,6 +242,13 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public int clean(CleanPolicy policy) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanInternal(policy);
+        }
+    }
+    /** 表级清理先取导出写锁再进入数据库访问，不驱动全库容量删除。 */
+    private int cleanInternal(CleanPolicy policy) {
         // 清理与导出快照复制互斥：先取写锁（锁序 exportGuard → helper）
         exportGuard.writeLock().lock();
         try {
@@ -228,6 +285,13 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public int cleanBefore(long timestamp) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanBeforeInternal(timestamp);
+        }
+    }
+    /** 在导出写锁内删除截止时间之前的记录，阻止与快照复制交错。 */
+    private int cleanBeforeInternal(long timestamp) {
         // 清理与导出快照复制互斥：先取写锁（锁序 exportGuard → helper）
         exportGuard.writeLock().lock();
         try {
@@ -243,6 +307,13 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public int cleanByCount(int keepCount) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanByCountInternal(keepCount);
+        }
+    }
+    /** 在导出写锁内保留指定数量的最新记录，再删除其余记录。 */
+    private int cleanByCountInternal(int keepCount) {
         if (keepCount < 0) {
             keepCount = 0;
         }
@@ -262,6 +333,13 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public long getRecordCount() {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return getRecordCountInternal();
+        }
+    }
+    /** 在当前存活许可内取得表总数。 */
+    private long getRecordCountInternal() {
         try {
             return helper.queryLong("SELECT COUNT(*) FROM log_record", null);
         } catch (SQLException e) {
@@ -271,11 +349,25 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public long getDbSizeBytes() {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return getDbSizeBytesInternal();
+        }
+    }
+    /** 在当前存活许可内读取原存储的容量展示值；严格维护度量由协调器负责。 */
+    private long getDbSizeBytesInternal() {
         return helper.getDbSizeBytes();
     }
 
     @Override
     public long count(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return countInternal(query);
+        }
+    }
+    /** 在当前存活许可内按统一查询条件统计数量。 */
+    private long countInternal(LogQuery query) {
         if (query == null) {
             return getRecordCount();
         }
@@ -427,8 +519,9 @@ public final class JdbcStorage implements IStorage {
         if (query.getUserFields() != null && !query.getUserFields().isEmpty()) {
             for (Map.Entry<String, String> e : query.getUserFields().entrySet()) {
                 sql.append(hasWhere ? " AND " : " WHERE ")
-                        .append("instr(user_fields, ?) > 0");
-                args.add(JsonUtil.userFieldMemberJson(e.getKey(), e.getValue()));
+                        .append("instr(',' || substr(user_fields, 2, length(user_fields) - 2) || ',', ?) > 0");
+                // 规范 JSON 的两端转换成成员分隔符，禁止命中转义键名的后缀。
+                args.add("," + JsonUtil.userFieldMemberJson(e.getKey(), e.getValue()) + ",");
                 hasWhere = true;
             }
         }
@@ -446,6 +539,8 @@ public final class JdbcStorage implements IStorage {
 
     @Override
     public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+        // 成功后许可转交快照，构造失败则在本方法释放。
+        final DatabaseOperationGuard.Scope operation = operationGuard.enter();
         final LogQuery q = query != null ? query : LogQuery.builder().build();
         // 锁序固定：exportGuard（读）→ helper；失败时释放读锁
         final ReentrantReadWriteLock.ReadLock readLock = exportGuard.readLock();
@@ -468,10 +563,11 @@ public final class JdbcStorage implements IStorage {
                 throw new ExportSnapshotException("log snapshot boundary capture failed", e);
             }
             open = true;
-            return new JdbcLogExportSnapshot(readLock, q, maxId, capturedCount);
+            return new JdbcLogExportSnapshot(readLock, q, maxId, capturedCount, operation);
         } finally {
             if (!open) {
                 readLock.unlock();
+                operation.close();
             }
         }
     }
@@ -482,6 +578,8 @@ public final class JdbcStorage implements IStorage {
     private final class JdbcLogExportSnapshot implements IExportSnapshot<LogRecord> {
         /** 打开时持有的读取保护锁（close 时释放） */
         private final ReentrantReadWriteLock.ReadLock readLock;
+        /** 从 open 转移的许可，释放表锁后归还。 */
+        private final DatabaseOperationGuard.Scope operation;
         /** 快照查询条件 */
         private final LogQuery query;
         /** 捕获的已提交最大 ID 边界 */
@@ -499,8 +597,10 @@ public final class JdbcStorage implements IStorage {
         private boolean closed = false;
 
         JdbcLogExportSnapshot(ReentrantReadWriteLock.ReadLock readLock, LogQuery query,
-                              long maxId, long capturedCount) {
+                              long maxId, long capturedCount,
+                DatabaseOperationGuard.Scope operation) {
             this.readLock = readLock;
+            this.operation = operation;
             this.query = query;
             this.maxId = maxId;
             this.capturedCount = capturedCount;
@@ -565,6 +665,7 @@ public final class JdbcStorage implements IStorage {
             if (!closed) {
                 closed = true;
                 readLock.unlock();
+                operation.close();
             }
         }
 

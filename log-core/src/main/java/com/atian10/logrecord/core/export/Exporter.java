@@ -239,75 +239,68 @@ public final class Exporter {
                               ExportEncoding encoding,
                               String filePath,
                               ExportCallback callback) {
-        // 1. 打开快照：捕获边界与匹配数量（不支持快照的存储在此明确失败）
-        final IExportSnapshot<T> snapshot;
-        try {
-            snapshot = opener.open();
-        } catch (Throwable t) {
-            return fail(callback, t, 0);
-        }
-        final long capturedCount = snapshot.getCapturedCount();
-
-        // 2. 复制阶段（持有读取保护）：匹配记录 → 私有原始快照文件
+        // 仅保留本次创建的临时文件引用；所有失败在资源清理之后统一通知。
         File snapshotFile = null;
-        try {
-            checkInterrupted();
-            snapshotFile = File.createTempFile("log-record-snapshot-", ".json");
-            copyToSnapshotFile(snapshot, snapshotFile);
-        } catch (Throwable t) {
-            closeQuietly(snapshot);
-            deleteQuietly(snapshotFile);
-            return fail(callback, t, 0);
-        } finally {
-            // 复制完成即释放读取保护：格式化与回调在保护范围外执行
-            snapshot.close();
-        }
-
-        // 3. 输出阶段（无读取保护）：快照文件 → 目标目录内本次专属临时文件
-        final AtomicLong written = new AtomicLong(0);
         File outputTemp = null;
+        Throwable failure = null;
+        AtomicLong written = new AtomicLong(0);
         try {
+            // count、读取及 close 全部属于同一个受保护区域，close 异常保留为 suppressed。
+            final long capturedCount;
+            try (IExportSnapshot<T> snapshot = opener.open()) {
+                if (snapshot == null) throw new IOException("snapshot opener returned null");
+                capturedCount = snapshot.getCapturedCount();
+                if (capturedCount < 0L) throw new IOException("negative snapshot count");
+                checkInterrupted();
+                snapshotFile = File.createTempFile("log-record-snapshot-", ".json");
+                copyToSnapshotFile(snapshot, snapshotFile, capturedCount);
+            }
+            // 快照许可已释放，格式化器和进度回调可安全发起关闭或其他业务。
             checkInterrupted();
             outputTemp = createOutputTempFile(filePath);
             writeOutputFile(snapshotFile, outputTemp, recordType, recordFormatter,
                     header, footer, format, encoding, capturedCount, written, callback);
-        } catch (Throwable t) {
-            deleteQuietly(outputTemp);
-            deleteQuietly(snapshotFile);
-            return fail(callback, t, safeInt(written.get()));
-        }
-
-        // 4. 发布：完整关闭后替换目标；失败保留原目标并清理本次临时文件
-        try {
+            if (written.get() != capturedCount) throw new IOException("export count differs from snapshot");
+            // 原始快照清理失败也在发布之前处理，保持失败时旧目标不变。
+            deleteOwned(snapshotFile);
+            snapshotFile = null;
+            checkInterrupted();
             publish(outputTemp, new File(filePath));
-        } catch (Throwable t) {
-            deleteQuietly(outputTemp);
-            deleteQuietly(snapshotFile);
-            return fail(callback, t, safeInt(written.get()));
+            outputTemp = null;
+        } catch (Throwable error) {
+            failure = error;
+        } finally {
+            failure = cleanupOwned(snapshotFile, failure);
+            failure = cleanupOwned(outputTemp, failure);
         }
-        deleteQuietly(snapshotFile);
+        if (failure != null) return fail(callback, failure, safeInt(written.get()));
         notifySuccess(callback, filePath, safeInt(written.get()));
         return safeInt(written.get());
     }
-
     /**
      * 把快照内容分批复制到私有原始快照文件（JSON 行，UTF-8）
      */
-    private <T> void copyToSnapshotFile(IExportSnapshot<T> snapshot, File snapshotFile)
+    private <T> void copyToSnapshotFile(IExportSnapshot<T> snapshot, File snapshotFile, long capturedCount)
             throws IOException {
+        // 逐页复制计数必须与打开时边界一致，空页不能掩盖读取提前结束。
+        long copied = 0L;
         try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
                 new FileOutputStream(snapshotFile), StandardCharsets.UTF_8))) {
             while (!snapshot.isExhausted()) {
                 checkInterrupted();
                 List<T> batch = snapshot.nextBatch(PAGE_SIZE);
-                if (batch == null || batch.isEmpty()) {
+                if (batch == null) throw new IOException("snapshot returned null page");
+                if (batch.isEmpty()) {
+                    if (!snapshot.isExhausted()) throw new IOException("snapshot ended before exhaustion");
                     break;
                 }
                 for (T record : batch) {
+                    if (++copied > capturedCount) throw new IOException("snapshot exceeded captured count");
                     bw.write(JsonUtil.toJson(record));
                     bw.write('\n');
                 }
             }
+            if (copied != capturedCount) throw new IOException("snapshot ended before captured count");
             bw.flush();
         }
     }
@@ -365,29 +358,27 @@ public final class Exporter {
         if (!parent.exists() && !parent.mkdirs()) {
             throw new IOException("cannot create export target directory: " + parent);
         }
-        File temp = new File(parent, target.getName()
-                + ".log-record-export-" + Long.toHexString(System.nanoTime()) + ".tmp");
-        if (!temp.createNewFile() && !temp.exists()) {
-            throw new IOException("cannot create export temp file: " + temp);
-        }
-        return temp;
+        return File.createTempFile("log-record-export-", ".tmp", parent);
     }
 
     /**
-     * 发布输出文件到目标路径
-     * <p>
-     * 先尝试 rename 原子替换（POSIX/Linux/Android 上可覆盖已存在目标）；
-     * 失败时（如 Windows 目标已存在）经反射调用 java.nio Files.move 的
-     * REPLACE_EXISTING 路径——反射隔离保证 Android API 21 不加载该类；
-     * 均失败则保留原目标并抛出，不采用"先删除旧文件再移动"。
-     * </p>
+     * 仅使用平台承诺的原子重命名；不支持时失败，不降级为先删目标的移动。
+     * Android API 21 使用隔离的 Os.rename；桌面使用 NIO ATOMIC_MOVE。
      */
     private void publish(File source, File target) throws IOException {
-        if (!source.renameTo(target)) {
-            nioMoveReflective(source, target);
+        // 只在 Android 加载系统 Os；Java 桌面没有该类，使用独立的 NIO 实现。
+        final Class<?> os;
+        try { os = Class.forName("android.system.Os"); }
+        catch (ClassNotFoundException desktop) { nioMoveReflective(source, target); return; }
+        try {
+            os.getMethod("rename", String.class, String.class)
+                    .invoke(null, source.getAbsolutePath(), target.getAbsolutePath());
+        } catch (InvocationTargetException error) {
+            throw new IOException("atomic rename failed", error.getCause());
+        } catch (ReflectiveOperationException error) {
+            throw new IOException("atomic rename unavailable", error);
         }
     }
-
     /**
      * 反射调用 NioFileMove（隔离 java.nio.file 引用，避免 Android API 21 加载失败）
      */
@@ -457,7 +448,7 @@ public final class Exporter {
      * 线程中断视为取消：抛出异常走统一失败清理
      */
     private static void checkInterrupted() throws IOException {
-        if (Thread.interrupted()) {
+        if (Thread.currentThread().isInterrupted()) {
             throw new IOException("export cancelled by thread interrupt");
         }
     }
@@ -469,20 +460,21 @@ public final class Exporter {
         return value > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) value;
     }
 
-    private void closeQuietly(IExportSnapshot<?> snapshot) {
-        try {
-            snapshot.close();
-        } catch (Throwable ignored) {
-            // 关闭失败不影响失败主流程
-        }
+    /** 仅清理本次明确创建的文件；失败不会静默转成发布成功。 */
+    private static void deleteOwned(File file) throws IOException {
+        if (file != null && file.exists() && !file.delete())
+            throw new IOException("cannot delete owned export temp: " + file);
     }
 
-    private void deleteQuietly(File file) {
-        if (file != null && file.exists() && !file.delete()) {
-            file.deleteOnExit();
+    /** 清理错误附加到首个异常，保证不会跳过唯一终态回调。 */
+    private static Throwable cleanupOwned(File file, Throwable failure) {
+        try { deleteOwned(file); }
+        catch (Throwable cleanupError) {
+            if (failure == null) return cleanupError;
+            if (failure != cleanupError) failure.addSuppressed(cleanupError);
         }
+        return failure;
     }
-
     // ===== 输出头尾与行格式 =====
 
     /**

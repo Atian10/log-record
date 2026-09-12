@@ -28,9 +28,9 @@ public final class CleanResult {
     private final int deletedLogs;
     /** 容量阶段删除的异常条数 */
     private final int deletedExceptions;
-    /** 维护开始时数据库相关文件总长（字节） */
+    /** 维护开始时数据库相关文件总长（字节）；-1 表示尚无可靠度量。 */
     private final long bytesBefore;
-    /** 维护结束时数据库相关文件总长（字节） */
+    /** 维护结束时数据库相关文件总长（字节）；-1 表示未度量或维护异常后未知。 */
     private final long bytesAfter;
     /** 预算字节数 */
     private final long targetBytes;

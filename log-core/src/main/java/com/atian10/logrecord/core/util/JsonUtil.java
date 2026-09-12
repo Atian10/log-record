@@ -57,8 +57,8 @@ public final class JsonUtil {
      * <p>
      * 用于 userFields 查询条件：与 {@link #mapToJson} 使用同一 Gson 配置序列化
      * 单项键值，取出形如 {@code "key":"value"} 的成员片段（value 为 null 时为
-     * {@code "key":null}）。存储层用该片段做参数化子串匹配（如 SQLite instr），
-     * 保证大小写敏感，并正确处理引号、反斜杠、换行等 JSON 转义，与写入表示一致。
+     * {@code "key":null}）。存储层将对象外层大括号转换为逗号，并在本片段前后加逗号
+     * 做完整成员匹配；裸片段不足以排除转义键名后缀。序列化配置与写入一致。
      * </p>
      * <p>适用范围限定为本库统一配置生成的字符串映射 JSON；外部导入的非规范
      * JSON 或其他值类型不经额外验证不承诺匹配。</p>

@@ -27,6 +27,13 @@ public final class CapacityBudgets {
         // 工具类禁止实例化
     }
 
+    /** 新旧 MB 字段共用溢出检查；先校验再相乘，兼容 Android API 21。 */
+    static long checkedBytes(long sizeMb, String name) {
+        if (sizeMb < 0L || sizeMb > Long.MAX_VALUE / BYTES_PER_MB)
+            throw new IllegalArgumentException(name + " is outside supported range: " + sizeMb);
+        return sizeMb * BYTES_PER_MB;
+    }
+
     /**
      * 从配置解析容量预算
      *
@@ -58,7 +65,7 @@ public final class CapacityBudgets {
                         "databaseMaxSizeMB conflicts with legacy maxDbSizeMB in enabled policies");
             }
             // 显式预算：覆盖全部启用清理策略的表；禁用策略的表受保护
-            return new CapacityBudget(newSizeMb * BYTES_PER_MB,
+            return new CapacityBudget(checkedBytes(newSizeMb, "databaseMaxSizeMB"),
                     isEnabled(logPolicy), isEnabled(expPolicy));
         }
 
@@ -72,7 +79,7 @@ public final class CapacityBudgets {
                             + logOld + " vs " + expOld);
         }
         long mb = Math.max(logOld, expOld);
-        return new CapacityBudget(mb * BYTES_PER_MB, logOld > 0L, expOld > 0L);
+        return new CapacityBudget(checkedBytes(mb, "maxDbSizeMB"), logOld > 0L, expOld > 0L);
     }
 
     /**

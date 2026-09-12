@@ -7,8 +7,7 @@ import java.io.IOException;
  * 基于 java.nio.file 的原子替换移动（仅桌面/服务器 JVM 路径）
  * <p>
  * 本类独立存放 java.nio.file 引用：Android API 21 上 {@code java.nio.file}
- * 不可用，导出器仅在 {@code File.renameTo} 失败（如 Windows 目标已存在）时
- * 才通过反射加载本类执行替换，避免在低版本 Android 触发类加载失败。
+ * 不可用，Android 使用 Os.rename；仅桌面路径反射加载本类。
  * </p>
  */
 final class NioFileMove {
@@ -18,7 +17,7 @@ final class NioFileMove {
     }
 
     /**
-     * 以 REPLACE_EXISTING 语义移动文件（目标存在则替换）
+     * 原子移动文件；文件系统不支持原子替换已有目标时明确失败。
      * <p>方法为 public 以便导出器经 {@link Class#getMethod} 反射定位（类保持包私有）</p>
      *
      * @param source 源文件
@@ -27,6 +26,7 @@ final class NioFileMove {
      */
     public static void move(File source, File target) throws IOException {
         java.nio.file.Files.move(source.toPath(), target.toPath(),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 }

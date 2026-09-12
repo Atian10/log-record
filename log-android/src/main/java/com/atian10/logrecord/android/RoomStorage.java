@@ -1,5 +1,7 @@
 package com.atian10.logrecord.android;
 
+import com.atian10.logrecord.core.DatabaseOperationGuard;
+
 import androidx.sqlite.db.SimpleSQLiteQuery;
 
 import android.os.Looper;
@@ -34,17 +36,19 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * 实现 {@link IStorage}，将日志持久化到 Room/SQLite。
  * 动态查询通过 {@link SimpleSQLiteQuery} 拼接 SQL 实现。
  * user_fields 的键值对查询按与写入一致的规范 JSON 成员片段，
- * 用参数化 {@code instr} 子串匹配（大小写敏感）。
+ * 以两侧逗号包围完整成员，再用参数化 {@code instr} 匹配（大小写敏感）。
  * </p>
  */
 public final class RoomStorage implements IStorage {
+    /** 同一数据库的操作许可，覆盖复合访问及整个导出快照。 */
+    private final DatabaseOperationGuard operationGuard;
 
     private final LogDatabase database;
     private final LogDao dao;
 
     /**
      * 导出读取保护：快照复制持读锁，清理持写锁互斥
-     * <p>锁序固定为 exportGuard → dao/Room 内部锁，
+     * <p>锁序固定为操作许可 → exportGuard → 维护锁 → dao/Room 内部锁，
      * 任何持 Room 锁的路径不得再等待本锁，避免死锁</p>
      */
     private final ReentrantReadWriteLock exportGuard = new ReentrantReadWriteLock();
@@ -58,11 +62,20 @@ public final class RoomStorage implements IStorage {
             throw new NullPointerException("database == null");
         }
         this.database = database;
+        this.operationGuard = database.getOperationGuard();
         this.dao = database.logDao();
     }
 
     @Override
     public void write(LogRecord record) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            writeInternal(record);
+        }
+    }
+    /** 在存活许可内转换并写入单条记录，错误由原存储契约上报。 */
+    private void writeInternal(LogRecord record) {
         LogEntity entity = LogEntityConverter.toEntity(record);
         if (entity != null) {
             dao.insert(entity);
@@ -71,6 +84,14 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public void writeBatch(List<LogRecord> records) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            writeBatchInternal(records);
+        }
+    }
+    /** 在同一外层存活许可内提交整批，保留逐条或事务级结果。 */
+    private void writeBatchInternal(List<LogRecord> records) {
         if (records == null || records.isEmpty()) {
             return;
         }
@@ -88,6 +109,14 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public List<LogRecord> query(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            return queryInternal(query);
+        }
+    }
+    /** 在存活许可内完成查询及实体转换，使用原查询的错误兼容语义。 */
+    private List<LogRecord> queryInternal(LogQuery query) {
         warnIfMainThread("query");
         if (query == null) {
             return new ArrayList<>();
@@ -109,6 +138,14 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public LogStatistics statistics(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            return statisticsInternal(query);
+        }
+    }
+    /** 在一个存活许可内完成总数和分组查询，避免关闭切入子查询之间。 */
+    private LogStatistics statisticsInternal(LogQuery query) {
         warnIfMainThread("statistics");
         // 复用 count(query) 保证 total 与 WHERE 条件一致；
         // 三个维度（level/type/tag）通过 buildGroupBySql 拼接 GROUP BY 聚合 SQL，
@@ -165,9 +202,16 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public int clean(CleanPolicy policy) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanInternal(policy);
+        }
+    }
+    /** 表级清理先取导出写锁再进入数据库访问，不驱动全库容量删除。 */
+    private int cleanInternal(CleanPolicy policy) {
         // 清理与导出快照复制互斥：先取写锁（锁序 exportGuard → dao）
         exportGuard.writeLock().lock();
-        try {
+        try (DatabaseOperationGuard.Access access = operationGuard.read()) {
             if (policy == null || !policy.isEnabled()) {
                 return 0;
             }
@@ -190,9 +234,16 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public int cleanBefore(long timestamp) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanBeforeInternal(timestamp);
+        }
+    }
+    /** 在导出写锁内删除截止时间之前的记录，阻止与快照复制交错。 */
+    private int cleanBeforeInternal(long timestamp) {
         // 清理与导出快照复制互斥：先取写锁（锁序 exportGuard → dao）
         exportGuard.writeLock().lock();
-        try {
+        try (DatabaseOperationGuard.Access access = operationGuard.read()) {
             return dao.cleanBefore(timestamp);
         } finally {
             exportGuard.writeLock().unlock();
@@ -201,12 +252,19 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public int cleanByCount(int keepCount) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
+            return cleanByCountInternal(keepCount);
+        }
+    }
+    /** 在导出写锁内保留指定数量的最新记录，再删除其余记录。 */
+    private int cleanByCountInternal(int keepCount) {
         if (keepCount < 0) {
             keepCount = 0;
         }
         // 清理与导出快照复制互斥：先取写锁（锁序 exportGuard → dao）
         exportGuard.writeLock().lock();
-        try {
+        try (DatabaseOperationGuard.Access access = operationGuard.read()) {
             return dao.cleanByCount(keepCount);
         } finally {
             exportGuard.writeLock().unlock();
@@ -215,11 +273,27 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public long getRecordCount() {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            return getRecordCountInternal();
+        }
+    }
+    /** 在当前存活许可内取得表总数。 */
+    private long getRecordCountInternal() {
         return dao.countAll();
     }
 
     @Override
     public long getDbSizeBytes() {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            return getDbSizeBytesInternal();
+        }
+    }
+    /** 在当前存活许可内读取原存储的容量展示值；严格维护度量由协调器负责。 */
+    private long getDbSizeBytesInternal() {
         try {
             String path = database.getOpenHelper().getReadableDatabase().getPath();
             if (path != null) {
@@ -235,6 +309,14 @@ public final class RoomStorage implements IStorage {
 
     @Override
     public long count(LogQuery query) {
+        // 外层许可覆盖整个方法，数据库不会在嵌套访问之间被关闭。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter();
+             DatabaseOperationGuard.Access access = operationGuard.read()) {
+            return countInternal(query);
+        }
+    }
+    /** 在当前存活许可内按统一查询条件统计数量。 */
+    private long countInternal(LogQuery query) {
         warnIfMainThread("count");
         if (query == null) {
             return dao.countAll();
@@ -339,8 +421,9 @@ public final class RoomStorage implements IStorage {
         if (query.getUserFields() != null && !query.getUserFields().isEmpty()) {
             for (Map.Entry<String, String> e : query.getUserFields().entrySet()) {
                 sql.append(hasWhere ? " AND " : " WHERE ")
-                        .append("instr(user_fields, ?) > 0");
-                args.add(JsonUtil.userFieldMemberJson(e.getKey(), e.getValue()));
+                        .append("instr(',' || substr(user_fields, 2, length(user_fields) - 2) || ',', ?) > 0");
+                // 与 JDBC 共用完整成员边界，字段名的转义引号后缀不能冒充独立键。
+                args.add("," + JsonUtil.userFieldMemberJson(e.getKey(), e.getValue()) + ",");
                 hasWhere = true;
             }
         }
@@ -356,32 +439,16 @@ public final class RoomStorage implements IStorage {
         return exportGuard;
     }
 
-    /**
-     * 删除时间戳不晚于阈值的最旧一批记录（全库容量协调使用；调用方须持有导出保护写锁）
-     * @param ts 时间戳上界（包含）
-     * @param limit 本批上限
-     * @return 删除的记录数
-     */
-    int deleteOldestUpTo(long ts, int limit) {
-        return dao.deleteOldestUpTo(ts, limit);
-    }
-
-    /**
-     * 取最旧的 N 条时间戳（升序；供容量协调计算跨表批次上界）
-     */
-    List<Long> oldestTimestamps(int limit) {
-        List<Long> list = dao.oldestTimestamps(limit);
-        return list != null ? list : new ArrayList<>();
-    }
-
     @Override
     public IExportSnapshot<LogRecord> openExportSnapshot(LogQuery query) {
+        // 成功后许可转交快照，构造失败则在本方法释放。
+        final DatabaseOperationGuard.Scope operation = operationGuard.enter();
         final LogQuery q = query != null ? query : LogQuery.builder().build();
         // 锁序固定：exportGuard（读）→ dao；失败时释放读锁
         final ReentrantReadWriteLock.ReadLock readLock = exportGuard.readLock();
         readLock.lock();
         boolean open = false;
-        try {
+        try (DatabaseOperationGuard.Access access = operationGuard.read()) {
             warnIfMainThread("openExportSnapshot");
             final long maxId;
             final long capturedCount;
@@ -401,10 +468,11 @@ public final class RoomStorage implements IStorage {
                 throw new ExportSnapshotException("log snapshot boundary capture failed", t);
             }
             open = true;
-            return new RoomLogExportSnapshot(readLock, q, maxId, capturedCount);
+            return new RoomLogExportSnapshot(readLock, q, maxId, capturedCount, operation);
         } finally {
             if (!open) {
                 readLock.unlock();
+                operation.close();
             }
         }
     }
@@ -415,6 +483,8 @@ public final class RoomStorage implements IStorage {
     private final class RoomLogExportSnapshot implements IExportSnapshot<LogRecord> {
         /** 打开时持有的读取保护锁（close 时释放） */
         private final ReentrantReadWriteLock.ReadLock readLock;
+        /** 从 open 转移的许可，释放表锁后归还。 */
+        private final DatabaseOperationGuard.Scope operation;
         /** 快照查询条件 */
         private final LogQuery query;
         /** 捕获的已提交最大 ID 边界 */
@@ -432,8 +502,10 @@ public final class RoomStorage implements IStorage {
         private boolean closed = false;
 
         RoomLogExportSnapshot(ReentrantReadWriteLock.ReadLock readLock, LogQuery query,
-                              long maxId, long capturedCount) {
+                              long maxId, long capturedCount,
+                DatabaseOperationGuard.Scope operation) {
             this.readLock = readLock;
+            this.operation = operation;
             this.query = query;
             this.maxId = maxId;
             this.capturedCount = capturedCount;
@@ -452,6 +524,8 @@ public final class RoomStorage implements IStorage {
 
         @Override
         public List<LogRecord> nextBatch(int maxRows) {
+            // 每页短暂持维护读锁，快照许可在分页间隙仍保持活跃。
+            try (DatabaseOperationGuard.Access access = operationGuard.read()) {
             if (closed) {
                 throw new IllegalStateException("snapshot already closed");
             }
@@ -491,6 +565,7 @@ public final class RoomStorage implements IStorage {
                 // 严格读取语义：失败抛出，不得伪装为空数据
                 throw new ExportSnapshotException("log snapshot page read failed", t);
             }
+            }
         }
 
         @Override
@@ -498,6 +573,7 @@ public final class RoomStorage implements IStorage {
             if (!closed) {
                 closed = true;
                 readLock.unlock();
+                operation.close();
             }
         }
 

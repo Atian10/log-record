@@ -64,7 +64,8 @@ public final class DesktopLogInit {
     }
 
     /** 当前发布的所有者；成功初始化前保持不变，关闭后置 null */
-    private static volatile HelperOwner owner;
+    private static final java.util.concurrent.atomic.AtomicReference<HelperOwner> owner =
+            new java.util.concurrent.atomic.AtomicReference<>();
 
     private DesktopLogInit() {
         // 工具类禁止实例化
@@ -103,7 +104,7 @@ public final class DesktopLogInit {
      * @return LogManager 实例
      * @throws IllegalStateException 重复初始化或数据库初始化失败时抛出
      */
-    public static LogManager init(String dbPath, LogConfig.Builder configBuilder,
+    public static synchronized LogManager init(String dbPath, LogConfig.Builder configBuilder,
                                   boolean registerShutdownHook) {
         if (dbPath == null || dbPath.isEmpty()) {
             throw new IllegalArgumentException("dbPath is null or empty");
@@ -120,6 +121,8 @@ public final class DesktopLogInit {
             throw new IllegalStateException("JdbcHelper init failed: " + e.getMessage(), e);
         }
 
+        // 若后续注册钩子失败，先停止本次已启动的核心再释放候选资源。
+        LogManager initialized = null;
         try {
             // 2. 执行迁移（v1 无迁移，未来版本递增时生效）
             try {
@@ -158,12 +161,14 @@ public final class DesktopLogInit {
                     .exceptionStorage(exceptionStorage)
                     .consoleEnabled(false)
                     .capacityCoordinator(coordinator)
+                    .databaseOwner(candidate.getOperationGuard(), candidate::close)
                     .build();
 
             // 7. 核心初始化；成功后才发布所有者对（ISSUE-10：失败不得覆盖既有静态 helper）
             LogManager manager = LogManager.init(finalConfig);
+            initialized = manager;
             HelperOwner published = new HelperOwner(manager, candidate);
-            owner = published;
+            owner.set(published);
 
             // 8. 可选注册 JVM ShutdownHook（绑定本次发布的所有者，不经可变静态字段）
             if (registerShutdownHook) {
@@ -173,7 +178,8 @@ public final class DesktopLogInit {
 
             return manager;
         } catch (Throwable t) {
-            // 失败仅释放候选资源；已发布所有者不受影响
+            // 失败仅停止本次已启动的核心并释放候选，既有其他所有者不受影响。
+            if (initialized != null) initialized.shutdown(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
             try {
                 candidate.close();
             } catch (Throwable closeFailure) {
@@ -188,8 +194,8 @@ public final class DesktopLogInit {
      * @return 当前所有者的 helper；未初始化或已关闭时返回 null
      */
     public static JdbcHelper getHelper() {
-        HelperOwner current = owner;
-        return current != null ? current.helper : null;
+        HelperOwner current = owner.get();
+        return current != null && !current.manager.isTerminated() ? current.helper : null;
     }
 
     /**
@@ -197,7 +203,7 @@ public final class DesktopLogInit {
      * <p>等待排空完成后才关闭 helper；超时由后台线程在完全终止后关闭</p>
      */
     public static void shutdown() {
-        shutdownOwner(owner);
+        shutdownOwner(owner.get());
     }
 
     /**
@@ -207,30 +213,9 @@ public final class DesktopLogInit {
      * </p>
      */
     private static void shutdownOwner(HelperOwner target) {
-        if (target == null) {
-            return;
-        }
-        if (owner == target) {
-            owner = null;
-        }
-        ShutdownResult result = target.manager.shutdown(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
-        if (result.isFullyTerminated()) {
-            target.helper.close();
-            return;
-        }
-        // 排空超时：后台等待完全终止后再关闭 helper，不中断在途写入
-        Thread closer = new Thread(() -> {
-            while (!target.manager.isTerminated()) {
-                try {
-                    Thread.sleep(100L);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-            target.helper.close();
-        }, "log-record-helper-closer");
-        closer.setDaemon(true);
-        closer.start();
+        if (target == null) return;
+        // 直接 manager.shutdown 与平台入口共用一个收尾者，避免重复关闭连接。
+        target.manager.shutdown(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
+        if (target.manager.isTerminated()) owner.compareAndSet(target, null);
     }
 }

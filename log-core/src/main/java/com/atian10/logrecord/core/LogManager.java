@@ -82,7 +82,11 @@ public final class LogManager implements ILogger {
     /** 实例生命周期状态 */
     private volatile Lifecycle lifecycle = Lifecycle.RUNNING;
     /** 最近一次关闭结果（shutdown(long) 内同步保护），重复关闭时直接返回 */
-    private ShutdownResult lastShutdownResult = null;
+    private volatile ShutdownResult lastShutdownResult = null;
+    /** 数据库共同所有者及唯一后台收尾线程；等待在本实例 monitor 外进行。 */
+    private final DatabaseOperationGuard operationGuard;
+    private final Runnable databaseCloser;
+    private volatile Thread shutdownWorker;
 
     /**
      * 初始化日志库
@@ -130,6 +134,9 @@ public final class LogManager implements ILogger {
             throw new NullPointerException("config == null");
         }
         this.configUpdater = new LogConfigUpdater(config);
+        this.operationGuard = config.getDatabaseOperationGuard() != null
+                ? config.getDatabaseOperationGuard() : new DatabaseOperationGuard();
+        this.databaseCloser = config.getDatabaseCloser();
         // 缺省格式化器：初始化时配置的 formatter，未配置时使用 DefaultFormatter；
         // 运行时更新 formatter 只影响导出与控制台输出（每次使用时读取当前配置）
         this.effectiveFormatter = config.getFormatter() != null
@@ -140,7 +147,7 @@ public final class LogManager implements ILogger {
                 config.getQueueCapacity(),
                 config.getQueueFullPolicy(),
                 config.getBatchSize(),
-                config.getBatchIntervalMillis());
+                config.getBatchIntervalMillis(), operationGuard);
         this.exporter = new Exporter(
                 config.getStorage(),
                 config.getExceptionStorage(),
@@ -148,7 +155,7 @@ public final class LogManager implements ILogger {
         // 清理任务注入容量协调器与预算供应者（B4：表级规则之后执行全库容量阶段）
         this.cleanTask = new CleanTask(config.getStorage(), config.getExceptionStorage(),
                 config.getCapacityCoordinator(),
-                () -> com.atian10.logrecord.core.config.CapacityBudgets.resolve(configUpdater.get()));
+                () -> com.atian10.logrecord.core.config.CapacityBudgets.resolve(configUpdater.get()), operationGuard);
         // 启动定时清理
         cleanTask.start(config.getCleanPolicy(), config.getExceptionCleanPolicy());
     }
@@ -249,73 +256,74 @@ public final class LogManager implements ILogger {
     }
 
     @Override
-    public synchronized void shutdown() {
+    public void shutdown() {
         shutdown(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
     }
 
     /**
-     * 带超时关闭日志库
-     * <p>
-     * 顺序：停止接收新记录 → 停止清理调度并等待清理线程退出 → 等待引擎工作线程
-     * 完成排空并退出。队列排空由唯一工作线程负责，调用线程不执行兜底写入。
-     * 关闭幂等：已关闭时直接返回上次结果；并发调用会串行化后返回同一结果。
-     * </p>
-     * <p>
-     * 超时返回 {@link ShutdownResult.Outcome#TIMEOUT} 时，工作线程仍在后台排空；
-     * 本实例的静态引用仍会被清除以允许重新初始化（新实例不接管本实例资源），
-     * 底层数据库资源的释放应由资源所有者等待 {@link #isTerminated()} 为 true 后进行。
-     * </p>
-     * @param timeoutMillis 各阶段共享的等待时限（毫秒），负数按 0 处理
-     * @return 关闭结果
+     * 封闭准入后等待同一个后台收尾者；零或负时限仅返回状态。
+     * 超时保留 CLOSING 和单例，已有操作、清理和排空结束且资源关闭后才允许重建。
+     * 调用线程持有操作许可时立即返回，避免等待自身完成。
      */
-    public synchronized ShutdownResult shutdown(long timeoutMillis) {
-        if (lifecycle == Lifecycle.CLOSED) {
-            // 幂等：重复关闭返回上次结果，不再触碰任何资源或静态引用
-            return lastShutdownResult != null ? lastShutdownResult
-                    : ShutdownResult.completed(0L, true);
-        }
-        lifecycle = Lifecycle.CLOSING;
-        long deadlineNanos = System.nanoTime()
-                + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
-        // 1. 停止接收新记录并唤醒引擎工作线程
-        engine.stopAccepting();
-        // 2. 停止清理调度并等待清理线程退出（先于排空等待，避免清理与排空竞争存储）
-        boolean cleanerTerminated = cleanTask.shutdown(remainingMillis(deadlineNanos));
-        // 3. 等待工作线程完成排空并退出
-        ShutdownResult engineResult = engine.awaitShutdown(remainingMillis(deadlineNanos));
-        lifecycle = Lifecycle.CLOSED;
-        lastShutdownResult = engineResult.getOutcome() == ShutdownResult.Outcome.COMPLETED
-                ? ShutdownResult.completed(engineResult.getPendingCount(), cleanerTerminated)
-                : ShutdownResult.timeout(engineResult.getPendingCount(), cleanerTerminated);
-        // 仅当静态引用仍指向本实例时清除，避免旧实例关闭清掉新实例（ISSUE-09）；
-        // 清除后允许业务方重新 init
-        synchronized (LogManager.class) {
-            if (instance == this) {
-                instance = null;
+    public ShutdownResult shutdown(long timeoutMillis) {
+        // 整个调用共享一个 elapsed 预算，线程之间不在管理器 monitor 下相互等待。
+        long started = System.nanoTime();
+        long budget = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
+        startShutdown();
+        Thread closer = shutdownWorker;
+        if (!operationGuard.isCurrentThreadActive() && closer != Thread.currentThread()) {
+            long remaining = budget - (System.nanoTime() - started);
+            if (remaining > 0L) {
+                try { TimeUnit.NANOSECONDS.timedJoin(closer, remaining); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }
         }
-        return lastShutdownResult;
+        if (lifecycle == Lifecycle.CLOSED) return lastShutdownResult;
+        return ShutdownResult.timeout(engine.flush(0L).getPending(), cleanTask.isTerminated());
     }
 
-    /**
-     * 计算距截止时刻的剩余毫秒数（不足 1 毫秒按 0 处理）
-     */
-    private static long remainingMillis(long deadlineNanos) {
-        return Math.max(0L,
-                TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+    /** 只串行化一次状态转换和线程发布，所有耗时等待在 monitor 外执行。 */
+    private synchronized void startShutdown() {
+        if (lifecycle != Lifecycle.RUNNING) return;
+        lifecycle = Lifecycle.CLOSING;
+        engine.stopAccepting();
+        operationGuard.beginClosing();
+        cleanTask.shutdown(0L);
+        shutdownWorker = new Thread(this::finishShutdown, "log-record-owner-closer");
+        shutdownWorker.setDaemon(true);
+        shutdownWorker.start();
     }
 
-    /**
-     * 关闭流程是否已完全结束
-     * <p>生命周期已到 CLOSED 且引擎工作线程与清理线程均已退出；
-     * 为 true 时释放底层数据库资源才不会中断在途操作</p>
-     */
-    public boolean isTerminated() {
-        return lifecycle == Lifecycle.CLOSED
-                && engine.isTerminated()
-                && cleanTask.isTerminated();
+    /** 唯一资源收尾者：等写入、清理及整个快照退出，再释放本所有者数据库。 */
+    private void finishShutdown() {
+        try {
+            while (!engine.isTerminated()) engine.awaitShutdown(1000L);
+            while (!cleanTask.isTerminated()) cleanTask.shutdown(1000L);
+            while (!operationGuard.awaitIdle(1000L)) {
+                if (Thread.currentThread().isInterrupted()) return;
+            }
+            if (databaseCloser != null) databaseCloser.run();
+            lastShutdownResult = ShutdownResult.completed(0L, true);
+            synchronized (LogManager.class) {
+                if (instance == this) instance = null;
+                // 完成态最后发布，看到完成的调用方可以立即重新初始化。
+                lifecycle = Lifecycle.CLOSED;
+            }
+        } catch (Throwable failure) {
+            // 资源关闭失败保持 CLOSING，不伪造 fullyTerminated 或允许新实例重用资源。
+            lastWarning = "database shutdown failed: " + failure.getMessage();
+        }
     }
 
+    /** 包括平台资源关闭在内的收尾是否完成；超时后会由后台推进到 true。 */
+    public boolean isTerminated() { return lifecycle == Lifecycle.CLOSED; }
+    /** 平台重复初始化可复用 RUNNING 实例，但不能复用正在关闭的实例。 */
+    public boolean isClosing() { return lifecycle != Lifecycle.RUNNING; }
+
+    /** 对查询、导出、清理和配置等新业务入口拒绝关闭后的调用。 */
+    private void ensureRunning() {
+        if (lifecycle != Lifecycle.RUNNING) throw new IllegalStateException("LogManager is closing");
+    }
     // ===== 内部写入逻辑 =====
 
     /**
@@ -403,6 +411,9 @@ public final class LogManager implements ILogger {
      * 查询日志
      */
     public List<LogRecord> queryLogs(LogQuery query) {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         if (query == null) {
             return Collections.emptyList();
         }
@@ -412,12 +423,16 @@ public final class LogManager implements ILogger {
         } catch (Throwable t) {
             return Collections.emptyList();
         }
+        }
     }
 
     /**
      * 查询异常
      */
     public List<ExceptionRecord> queryExceptions(ExceptionQuery query) {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         if (query == null) {
             return Collections.emptyList();
         }
@@ -427,12 +442,16 @@ public final class LogManager implements ILogger {
         } catch (Throwable t) {
             return Collections.emptyList();
         }
+        }
     }
 
     /**
      * 聚合统计日志
      */
     public LogStatistics statistics(LogQuery query) {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         if (query == null) {
             return new LogStatistics(0, null, null, null);
         }
@@ -441,6 +460,7 @@ public final class LogManager implements ILogger {
             return result == null ? new LogStatistics(0, null, null, null) : result;
         } catch (Throwable t) {
             return new LogStatistics(0, null, null, null);
+        }
         }
     }
 
@@ -454,6 +474,7 @@ public final class LogManager implements ILogger {
      */
     public int exportLogs(LogQuery query, ExportFormat format, String filePath,
                           ExportCallback callback) {
+        ensureRunning();
         LogConfig config = configUpdater.get();
         return exporter.exportLogs(query, format, config.getExportEncoding(),
                 currentFormatter(config), filePath, callback);
@@ -466,6 +487,7 @@ public final class LogManager implements ILogger {
      */
     public int exportExceptions(ExceptionQuery query, ExportFormat format, String filePath,
                                 ExportCallback callback) {
+        ensureRunning();
         LogConfig config = configUpdater.get();
         return exporter.exportExceptions(query, format, config.getExportEncoding(),
                 currentFormatter(config), filePath, callback);
@@ -486,9 +508,15 @@ public final class LogManager implements ILogger {
      * @return 清理条数
      */
     public int cleanNow(CleanCallback callback) {
+        ensureRunning();
         LogConfig config = configUpdater.get();
         return cleanTask.runOnce(config.getCleanPolicy(),
                 config.getExceptionCleanPolicy(), callback);
+    }
+
+    /** 最近一轮全库容量结果；null 表示该轮未执行容量阶段，MET 才代表达标。 */
+    public com.atian10.logrecord.core.clean.CleanResult getLastCapacityResult() {
+        return cleanTask.getLastCapacityResult();
     }
 
     /**
@@ -497,6 +525,9 @@ public final class LogManager implements ILogger {
      * @return 清理条数
      */
     public int cleanBefore(long timestamp) {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         LogConfig config = configUpdater.get();
         int cleaned = 0;
         try {
@@ -510,6 +541,7 @@ public final class LogManager implements ILogger {
             recordInternalWarning("exceptionStorage.cleanBefore failed", t);
         }
         return cleaned;
+        }
     }
 
     /**
@@ -518,6 +550,9 @@ public final class LogManager implements ILogger {
      * @return 清理条数
      */
     public int cleanByCount(int keepCount) {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         LogConfig config = configUpdater.get();
         int cleaned = 0;
         try {
@@ -531,6 +566,7 @@ public final class LogManager implements ILogger {
             recordInternalWarning("exceptionStorage.cleanByCount failed", t);
         }
         return cleaned;
+        }
     }
 
     // ===== 配置与状态方法 =====
@@ -546,6 +582,7 @@ public final class LogManager implements ILogger {
      * 获取配置更新器（用于运行时动态修改配置）
      */
     public LogConfigUpdater getConfigUpdater() {
+        ensureRunning();
         return configUpdater;
     }
 
@@ -582,11 +619,15 @@ public final class LogManager implements ILogger {
      * 获取日志总记录数
      */
     public long getLogCount() {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         try {
             return configUpdater.get().getStorage().getRecordCount();
         } catch (Throwable t) {
             recordInternalWarning("storage.getRecordCount failed", t);
             return -1;
+        }
         }
     }
 
@@ -594,11 +635,15 @@ public final class LogManager implements ILogger {
      * 获取异常总记录数
      */
     public long getExceptionCount() {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         try {
             return configUpdater.get().getExceptionStorage().getRecordCount();
         } catch (Throwable t) {
             recordInternalWarning("exceptionStorage.getRecordCount failed", t);
             return -1;
+        }
         }
     }
 
@@ -606,11 +651,15 @@ public final class LogManager implements ILogger {
      * 获取数据库大小（字节）
      */
     public long getDbSizeBytes() {
+        ensureRunning();
+        // 门面复合操作跨两张表时仍使用一个存活期许可。
+        try (DatabaseOperationGuard.Scope operation = operationGuard.enter()) {
         try {
             return configUpdater.get().getStorage().getDbSizeBytes();
         } catch (Throwable t) {
             recordInternalWarning("storage.getDbSizeBytes failed", t);
             return -1;
+        }
         }
     }
 
@@ -628,6 +677,7 @@ public final class LogManager implements ILogger {
      * <p>建议在通过 getConfigUpdater().updateCleanPolicy/updateExceptionCleanPolicy 后调用</p>
      */
     public void refreshCleanPolicies() {
+        ensureRunning();
         LogConfig config = configUpdater.get();
         cleanTask.updatePolicies(config.getCleanPolicy(),
                 config.getExceptionCleanPolicy());

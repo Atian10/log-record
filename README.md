@@ -96,6 +96,14 @@ dependencies {
 }
 ```
 
+## 当前工作区修复说明
+
+本轮修改包含 flush 目标累计结果及 UNKNOWN、活动操作关闭保护、原子导出发布和容量失败后的仅恢复状态。当前仅完成源码与文档的静态复核，未执行本轮编译、测试、打包或设备验证；发布版本和已有制品是否包含这些修复，需按其对应源码提交另行核对。
+
+- `FlushResult.getSaved()/getFailed()/getDropped()/getUnknown()` 是等待期间增量；`getTargetSaved()/getTargetFailed()/getTargetDropped()/getTargetUnknown()` 包含调用前的历史结果。`isAllPersisted()` 才判断整个目标是否保存成功。
+- `shutdown(0)` 只发起关闭并立即查询状态；管理器等待写入、清理和活动快照结束后关闭其平台数据库。超时结果可由后续调用更新。
+- 容量结果由 `LogManager.get().getLastCapacityResult()` 获取；仅 MET 表示达标，其他结局走清理失败回调。详细边界见[使用文档](docs/使用文档.md)。
+
 ## 快速开始
 
 ### Android
