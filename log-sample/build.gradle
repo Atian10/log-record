@@ -4,8 +4,8 @@
 apply plugin: 'java'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
 }
 
 dependencies {
@@ -18,4 +18,5 @@ dependencies {
 // 编码统一 UTF-8
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
+    options.release = 11
 }

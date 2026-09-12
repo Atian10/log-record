@@ -2,10 +2,12 @@
 // 桌面/服务器适配（JDBC SQLite + Console）
 
 apply plugin: 'java-library'
+apply plugin: 'maven-publish'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+    withSourcesJar()
 }
 
 dependencies {
@@ -22,4 +24,14 @@ dependencies {
 // 编码统一 UTF-8
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
+    options.release = 11
+}
+
+// 发布组件元数据，使消费方同时获得 core 和运行时 SQLite JDBC 依赖。
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+        }
+    }
 }

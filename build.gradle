@@ -12,10 +12,18 @@ buildscript {
 
 // 全局仓库配置
 allprojects {
+    // 三个平台制品共享版本，JitPack 使用构建版本，本地验证使用显式临时版本。
+    group = 'com.github.Atian10.log-record'
+    version = rootProject.findProperty('libraryVersion') ?: System.getenv('VERSION') ?: '0.0.0-local-validation'
     repositories {
         google()
         mavenCentral()
     }
+}
+
+// 另一台开发设备的兼容上限固定为该组合，避免悄悄切换工具链。
+if (gradle.gradleVersion != '7.5' || JavaVersion.current() != JavaVersion.VERSION_11) {
+    throw new GradleException('本项目固定使用 Gradle 7.5 和 JDK 11，请检查 Wrapper 与 Gradle JDK。')
 }
 
 // 清理任务：删除根模块及所有子模块的 build 目录

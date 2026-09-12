@@ -2,6 +2,7 @@ package com.atian10.logrecord.android.room;
 
 import androidx.room.ColumnInfo;
 import androidx.room.Entity;
+import androidx.room.Ignore;
 import androidx.room.Index;
 import androidx.room.PrimaryKey;
 
@@ -73,14 +74,15 @@ public final class LogEntity {
     public int hasException;
 
     /**
-     * 默认构造（Room 反射需要）
+     * 无参构造，供 Room 生成的映射代码及转换器创建实体。
      */
     public LogEntity() {
     }
 
     /**
-     * 全参构造（便于 Converter 创建）
+     * 全参构造，供调用方手动创建实体；Room 映射时忽略此构造。
      */
+    @Ignore
     public LogEntity(long id, long timestamp, int level, String type, String tag,
                      String threadName, long threadId, String methodName, int lineNumber,
                      String message, String userFields, String versionTag, int hasException) {

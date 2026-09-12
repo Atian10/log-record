@@ -1,0 +1,7 @@
+# JitPack 构建配置
+# 构建 JDK 与五个模块的 Java 11 编译目标保持一致，Wrapper 固定 Gradle 7.5。
+jdk:
+  - openjdk11
+# 仅发布三个库模块；任务在 JitPack 构建环境内写入其本地 Maven 仓库。
+install:
+  - ./gradlew --no-daemon :log-core:publishToMavenLocal :log-desktop:publishToMavenLocal :log-android:publishToMavenLocal

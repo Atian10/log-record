@@ -1,4 +1,0 @@
-# JitPack 构建配置
-# 确保使用 Java 8 编译，与项目 sourceCompatibility/targetCompatibility 一致
-jdk:
-  - openjdk8

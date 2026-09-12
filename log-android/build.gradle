@@ -2,6 +2,7 @@
 // Android 平台适配（Room + Logcat）
 
 apply plugin: 'com.android.library'
+apply plugin: 'maven-publish'
 
 android {
     namespace 'com.atian10.logrecord.android'
@@ -11,10 +12,10 @@ android {
         minSdk 21
         targetSdk 33
 
-        // Room schema 导出位置
+        // 验证时写入独立目录；普通构建继续使用已有 schema 目录。
         javaCompileOptions {
             annotationProcessorOptions {
-                arguments += ["room.schemaLocation": "$projectDir/schemas".toString()]
+                arguments += ["room.schemaLocation": (project.findProperty('roomSchemaDir') ?: "$projectDir/schemas").toString()]
             }
         }
 
@@ -23,14 +24,32 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // 仅提供 Release 库制品，两个示例模块不进入发布集合。
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+        }
     }
 
     // 纯代码库，关闭非必要构建特性以加速构建
     buildFeatures {
         buildConfig false
         resValues false
+    }
+}
+
+// AGP 7.4 在配置完成后提供 Release 组件，由组件生成完整依赖元数据。
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+            }
+        }
     }
 }
 
@@ -41,6 +60,10 @@ dependencies {
     // Room 数据库
     implementation 'androidx.room:room-runtime:2.5.2'
     annotationProcessor 'androidx.room:room-compiler:2.5.2'
+
+    // 将标准库版本对齐传递给独立消费方，避免 stdlib 1.8.0 与旧 jdk7/jdk8 重复类。
+    // 沿用示例已有的 1.8.0 基线，不增加 Kotlin 编译插件或变更 AGP/JDK。
+    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.0')
 
     // AndroidX 注解
     implementation 'androidx.annotation:annotation:1.6.0'

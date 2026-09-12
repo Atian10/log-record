@@ -2,10 +2,12 @@
 // 纯 Java SE 实现，零平台依赖
 
 apply plugin: 'java-library'
+apply plugin: 'maven-publish'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+    withSourcesJar()
 }
 
 dependencies {
@@ -19,4 +21,14 @@ dependencies {
 // 编码统一 UTF-8
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
+    options.release = 11
+}
+
+// 从 Java 组件发布，保留 Gson 等传递依赖及 Java 11 兼容属性。
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+        }
+    }
 }

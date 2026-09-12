@@ -1,0 +1,42 @@
+import java.time.Duration
+import org.gradle.api.tasks.testing.Test
+
+// 此脚本仅由非真机验证入口通过 -I 加载，不改变普通 AS 构建的目录和签名。
+def verificationProperties = gradle.startParameter.projectProperties
+def verificationWorkspace = new File(verificationProperties['verificationWorkspace']).canonicalFile
+def verificationRoot = new File(verificationProperties['verificationRoot']).canonicalFile
+def verificationBase = new File(verificationWorkspace, 'build/verification').canonicalFile
+if (!verificationRoot.toPath().startsWith(verificationBase.toPath()) || verificationRoot == verificationBase) {
+    throw new GradleException('验证目录必须是项目 build/verification 下的独立运行目录。')
+}
+
+gradle.beforeProject { project ->
+    // 各工程使用唯一名称，所有编译、报告和制品均写入本轮目录。
+    project.buildDir = new File(verificationRoot, "modules/${project.name}")
+    project.tasks.withType(Test).configureEach { testTask ->
+        // 每个测试类拥有独立 JVM，避免单例或异常线程影响下一个测试类。
+        def testTemporaryDirectory = new File(verificationRoot, "tmp/${project.name}")
+        testTemporaryDirectory.mkdirs()
+        workingDir = testTemporaryDirectory
+        systemProperty 'java.io.tmpdir', testTemporaryDirectory.absolutePath
+        systemProperty 'org.sqlite.tmpdir', testTemporaryDirectory.absolutePath
+        executable = new File(verificationProperties['verificationJavaHome'], 'bin/java.exe').absolutePath
+        maxParallelForks = 1
+        forkEvery = 1
+        ignoreFailures = false
+        timeout = Duration.ofMinutes(10)
+    }
+    project.plugins.withId('com.android.application') {
+        // 调试签名仅使用本轮临时密钥；不读取或替换正式签名。
+        project.android.signingConfigs.debug.storeFile = new File(verificationRoot, 'keys/debug.keystore')
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    // 即使将来任务依赖变化，也不允许验证入口进入设备、安装或远端发布路径。
+    graph.allTasks.each { task ->
+        if (task.name ==~ /(?i)(connected.*|managedDevice.*|install.*|uninstall.*|run|.*To.*Repository)/) {
+            throw new GradleException("非真机验证不允许执行任务：${task.path}")
+        }
+    }
+}

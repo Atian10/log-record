@@ -28,7 +28,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
@@ -142,27 +141,50 @@ public class ExportJdbcConsistencyTest {
         }
     }
 
+    /** 验证快照阻止清理、关闭后允许删除；失败时仍取消并有界回收清理线程。 */
     @Test
     public void cleanIsBlockedWhileSnapshotOpen_andRunsAfterClose() throws Exception {
         // 预置一条很旧的记录供 cleanBefore 删除
         storage.write(new LogRecord(1L, LogLevel.INFO, "T", "tag",
                 "t", 1L, null, 0, null, false, "ancient", null));
-        IExportSnapshot<LogRecord> snapshot = storage.openExportSnapshot(
-                LogQuery.builder().build());
+        // 清理结果由测试线程读取；任何退出路径都通过 finally 取消并回收任务。
         FutureTask<Integer> cleanTask = new FutureTask<>(() -> storage.cleanBefore(500_000L));
+        // 守护线程仅防止异常线程阻止 JVM 退出，未能按期限回收仍会使测试失败。
+        Thread cleaner = new Thread(cleanTask, "test-cleaner");
+        cleaner.setDaemon(true);
+        // 保留断言、任务或快照关闭的首个失败，回收失败只能作为附加证据。
+        Throwable primaryFailure = null;
         try {
-            assertEquals(SEED_COUNT + 1, snapshot.getCapturedCount());
-            Thread cleaner = new Thread(cleanTask, "test-cleaner");
-            cleaner.start();
-            // 快照持读锁：清理应被阻塞（400ms 内不得完成）
-            Thread.sleep(400);
-            assertFalse("clean should be blocked while snapshot is open", cleanTask.isDone());
+            // 同线程打开并关闭快照；关闭失败不会覆盖块内已经发生的断言失败。
+            try (IExportSnapshot<LogRecord> snapshot = storage.openExportSnapshot(
+                    LogQuery.builder().build())) {
+                assertEquals(SEED_COUNT + 1, snapshot.getCapturedCount());
+                cleaner.start();
+                // 快照持读锁：清理应被阻塞（400ms 内不得完成）。
+                Thread.sleep(400);
+                assertFalse("clean should be blocked while snapshot is open", cleanTask.isDone());
+            }
+            // 先释放快照读锁，再限时取得删除数量，保留原有删除生效断言。
+            Integer cleaned = waitFor(cleanTask);
+            assertTrue("cleanBefore should delete at least the ancient record", cleaned >= 1);
+        } catch (Exception | Error failure) {
+            // failure 是当前测试最先暴露的错误，交由 JUnit 报告。
+            primaryFailure = failure;
+            throw failure;
         } finally {
-            snapshot.close(); // 释放读锁，清理继续
+            try {
+                stopCleaner(cleanTask, cleaner);
+            } catch (Exception | Error cleanupFailure) {
+                // 回收错误不能覆盖原始失败；若此前成功，则独立报告回收失败。
+                if (primaryFailure == null) {
+                    // 后续 @After 可能等待活动操作；在进入它之前留下可追溯的失败日志。
+                    cleanupFailure.printStackTrace(System.err);
+                    throw cleanupFailure;
+                }
+                primaryFailure.addSuppressed(cleanupFailure);
+                primaryFailure.printStackTrace(System.err);
+            }
         }
-        // 等待清理完成并核对删除生效
-        Integer cleaned = waitFor(cleanTask);
-        assertTrue("cleanBefore should delete at least the ancient record", cleaned >= 1);
     }
 
     @Test
@@ -229,13 +251,56 @@ public class ExportJdbcConsistencyTest {
     }
 
     /**
-     * 等待任务完成（最多 5 秒）
+     * 最多等待 5 秒取得 task 的结果；超时和任务异常交由调用方报告并回收线程。
      */
     private <T> T waitFor(FutureTask<T> task) throws Exception {
-        long deadline = System.currentTimeMillis() + 5000L;
-        while (!task.isDone() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20);
+        return task.get(5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 取消 task、中断 cleaner 并最多等待 5 秒退出；被中断仍尝试回收，最后恢复中断标记。
+     * 未回收或中断均显式失败，由调用方附加到已有测试失败，不能仅靠守护线程掩盖。
+     */
+    private void stopCleaner(FutureTask<?> task, Thread cleaner) throws InterruptedException {
+        task.cancel(true);
+        cleaner.interrupt();
+        // 单调时钟限定整个回收窗口，中断后继续等待也不会重置 5 秒期限。
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        // 保存回收期间首次中断，既恢复调用线程标记，也保留异常证据。
+        InterruptedException interruption = null;
+        try {
+            while (cleaner.isAlive()) {
+                // 剩余回收时间以纳秒计；期限耗尽后不得进入无期限 join。
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    TimeUnit.NANOSECONDS.timedJoin(cleaner, remaining);
+                } catch (InterruptedException interrupted) {
+                    // 暂存中断后继续完成有限回收，不在循环中恢复标记导致空转。
+                    if (interruption == null) {
+                        interruption = interrupted;
+                    } else {
+                        interruption.addSuppressed(interrupted);
+                    }
+                }
+            }
+            if (cleaner.isAlive()) {
+                // 即使线程是 daemon，也必须记录未回收；隔离 worker 的最终退出由外层验证管理。
+                AssertionError failure = new AssertionError("cleaner did not terminate within 5 seconds");
+                if (interruption != null) {
+                    failure.addSuppressed(interruption);
+                }
+                throw failure;
+            }
+            if (interruption != null) {
+                throw interruption;
+            }
+        } finally {
+            if (interruption != null) {
+                Thread.currentThread().interrupt();
+            }
         }
-        return task.get();
     }
 }
