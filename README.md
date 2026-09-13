@@ -56,7 +56,7 @@ dependencies {
 
 > 上述版本已完成精确提交和同提交标签两轮远程验收。Android 接入只声明 `log-android`，由 POM 传递 core 等依赖；不要使用聚合坐标同时引入 Android 与 Desktop。更换版本后需重新核对该版本的验证状态。
 
-三个库通过 Maven POM 描述模块坐标和传递依赖，并以 `sources` classifier 提供 `<模块名>-<版本>-sources.jar`。本版本不发布 Gradle Module Metadata（`.module`），POM 不含其重定向标记；Java 11 要求通过字节码和消费者构建检查。P5 已分别验证默认 Maven 解析和强制 POM 解析；这是 POM 发布策略验收，不代表旧 ModuleOnly 验收通过。
+三个库通过 Maven POM 描述模块坐标和传递依赖，并以 `sources` classifier 提供源码，例如 `log-core-v2.0.0-rc.1-sources.jar`。本版本不发布 Gradle Module Metadata（`.module`），POM 不含其重定向标记；Java 11 要求通过字节码和消费者构建检查。P5 已分别验证默认 Maven 解析和强制 POM 解析；这是 POM 发布策略验收，不代表旧 ModuleOnly 验收通过。
 
 Android 库保留 Kotlin BOM 1.8.0，并显式发布 `kotlin-stdlib-jdk7:1.8.0` 和 `kotlin-stdlib-jdk8:1.8.0` 两项运行时依赖，补齐 POM 消费时的标准库对齐，不要求 Maven 接入方另加 BOM 或强制版本规则。首次离线验证发现仅保留 BOM 时仍混入旧 jdk7/jdk8 1.7.20，后续复验结果见公开发布说明；目标版本仍为既定 1.8.0。
 
@@ -70,28 +70,29 @@ dependencies {
 }
 ```
 
-**方式三：AAR 文件依赖**
+**方式三：AAR 文件依赖（v2.0.0-rc.1）**
 
-```bash
-# 编译产出 AAR
-./gradlew :log-android:assembleRelease
-# 产出路径：log-android/build/outputs/aar/log-android-release.aar
-```
+下载本次已发布的两个文件，保留原文件名，放入 app 模块 `libs/` 目录：
 
-将 AAR 放入 app 模块 `libs/` 目录：
+- [log-android-v2.0.0-rc.1.aar](https://jitpack.io/com/github/Atian10/log-record/log-android/v2.0.0-rc.1/log-android-v2.0.0-rc.1.aar)
+- [log-core-v2.0.0-rc.1.jar](https://jitpack.io/com/github/Atian10/log-record/log-core/v2.0.0-rc.1/log-core-v2.0.0-rc.1.jar)
 
 ```gradle
 dependencies {
-    implementation files('libs/log-android-release.aar')
-    implementation files('libs/log-core-<相同版本>.jar')
+    implementation files('libs/log-android-v2.0.0-rc.1.aar')
+    implementation files('libs/log-core-v2.0.0-rc.1.jar')
     implementation 'com.google.code.gson:gson:2.10.1'
     implementation 'androidx.room:room-runtime:2.5.2'
     implementation 'androidx.annotation:annotation:1.6.0'
     implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.0')
+    runtimeOnly 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.0'
+    runtimeOnly 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.0'
 }
 ```
 
-单个 AAR 不包含 `log-core`，文件依赖也不会读取发布 POM 中的依赖及版本约束。上例需要另行准备同版本 core JAR；Room 等 Maven 依赖继续解析其传递依赖，Kotlin BOM 1.8.0 必须一并保留。全离线文件接入还需按实际解析图备齐传递制品及许可，不能只复制一个 AAR。优先使用本地 Module 或带完整 POM 的 Maven 仓库。
+单个 AAR 不包含 `log-core`，文件依赖也不会读取发布 POM 中的依赖及版本约束。上例两个库文件均使用 `v2.0.0-rc.1`，其余声明对应已发布 POM 的依赖；Kotlin BOM 和 jdk7/jdk8 的 1.8.0 对齐声明须一并保留。Room 等 Maven 依赖继续解析其传递依赖，因此项目仍需配置 `google()` 和 `mavenCentral()`。全离线文件接入还需按实际解析图备齐传递制品及许可。已完成的独立消费编译采用 Maven 方式，手动文件接入未另行编译验证；优先使用上面的 Maven 依赖。
+
+自行从源码构建可运行 `./gradlew :log-android:assembleRelease :log-core:jar`。未显式指定构建版本时，输出为 `log-android/build/outputs/aar/log-android-release.aar` 和 `log-core/build/libs/log-core-0.0.0-local-validation.jar`，引用时按实际文件名调整；这些本地输出与上面的远端发行文件分别命名。
 
 ### 桌面/服务器
 
@@ -105,21 +106,22 @@ dependencies {
 
 此依赖传递引入 `log-core`、Gson 和 SQLite JDBC，不引入 Android 模块。上面的标签版本已通过默认 Maven／强制 POM 两种模式的独立 Java 消费者编译与依赖检查。
 
-**JAR 文件依赖：**
+**JAR 文件依赖（v2.0.0-rc.1）：**
 
-```bash
-# 编译产出 JAR
-./gradlew :log-core:jar :log-desktop:jar
-# 产出路径：各模块 build/libs/<模块名>-<版本>.jar
-```
+下载以下两个文件并保留原文件名，放入消费模块的 `libs/` 目录：
+
+- [log-core-v2.0.0-rc.1.jar](https://jitpack.io/com/github/Atian10/log-record/log-core/v2.0.0-rc.1/log-core-v2.0.0-rc.1.jar)
+- [log-desktop-v2.0.0-rc.1.jar](https://jitpack.io/com/github/Atian10/log-record/log-desktop/v2.0.0-rc.1/log-desktop-v2.0.0-rc.1.jar)
 
 ```gradle
 dependencies {
-    implementation files('libs/log-core-<版本>.jar', 'libs/log-desktop-<版本>.jar')
+    implementation files('libs/log-core-v2.0.0-rc.1.jar', 'libs/log-desktop-v2.0.0-rc.1.jar')
     implementation 'com.google.code.gson:gson:2.10.1'
     implementation 'org.xerial:sqlite-jdbc:3.42.0.0'
 }
 ```
+
+Gson 和 SQLite JDBC 仍通过 `mavenCentral()` 解析；手动文件接入未另行编译验证。自行从源码构建可运行 `./gradlew :log-core:jar :log-desktop:jar`，默认产物为各模块 `build/libs/` 下的 `log-core-0.0.0-local-validation.jar`、`log-desktop-0.0.0-local-validation.jar`；本地构建版本与本次已发布版本分别使用。
 
 ## 修复、验证与版本状态
 
