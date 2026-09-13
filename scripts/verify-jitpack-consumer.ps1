@@ -10,6 +10,8 @@ param(
     [switch]$AllowRemoteBuild,
     [string]$Version,
     [string]$ExpectedCommit,
+    # 文档面向候选标签；精确 SHA 轮的实际依赖仍只使用 Version。
+    [string]$DocumentationVersion,
     [string]$JavaHome = 'E:\Java\temurin-11',
     [string]$SdkDirectory = 'E:\AndroidDev\Sdk',
     [string]$RunId = ('jitpack-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -21,8 +23,10 @@ if ($Version -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$' -or $Version.Contain
     throw 'Version 必须是明确的安全标签或提交版本，禁止路径字符、动态版本和 SNAPSHOT。'
 }
 if ($ExpectedCommit -notmatch '^[a-fA-F0-9]{40}$') { throw 'ExpectedCommit 必须是预期源码的完整 40 位提交 SHA。' }
+if ($DocumentationVersion -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$') { throw 'DocumentationVersion 必须是明确的候选标签版本。' }
 if ($RunId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,99}$') { throw 'RunId 只能包含字母、数字和连字符。' }
 $ExpectedCommit = $ExpectedCommit.ToLowerInvariant()
+if ($Version -cne $ExpectedCommit -and $Version -cne $DocumentationVersion) { throw 'Version 只能是 ExpectedCommit 或 DocumentationVersion，不请求其他版本。' }
 # 本轮只使用固定仓库，不接受任意远端、凭据或额外 Gradle 参数。
 $workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runRoot = [IO.Path]::GetFullPath((Join-Path $workspace "build/verification/$RunId"))
@@ -33,6 +37,9 @@ $commands = [Collections.Generic.List[object]]::new()
 $downloads = [Collections.Generic.List[object]]::new()
 $checks = [Collections.Generic.List[object]]::new()
 $remoteArtifacts = @{}
+# 单次运行内缓存精确提交的原始输入；快照列表另外保留工作区换行差异的证据。
+$frozenSources = @{}
+$snapshotEntries = [Collections.Generic.List[object]]::new()
 
 function Assert-NoReparsePoint([string]$Path) {
     # 从目标追溯到卷根，阻止已有联接或符号链接改变实际写入位置。
@@ -172,6 +179,238 @@ function Read-GitBytes([string[]]$Arguments) {
 function Get-BytesHash([byte[]]$Bytes) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($hasher.ComputeHash($Bytes)).Replace('-','') } finally { $hasher.Dispose() }
+}
+
+# Source 是仓库相对路径；只读目标提交并核对工作区，返回原始内容及来源身份，禁止混入未提交内容。
+function Get-FrozenSource([string]$Source) {
+    if ($frozenSources.ContainsKey($Source)) { return $frozenSources[$Source] }
+    # reference/blob 限定到 ExpectedCommit；字节及路径随后用于独立比较 Git 对象和实际检出文件。
+    $reference = $ExpectedCommit + ':' + $Source
+    $blob = $utf8.GetString((Read-GitBytes @('rev-parse',$reference))).Trim()
+    if ($blob -cnotmatch '^[a-f0-9]{40}$' -or $utf8.GetString((Read-GitBytes @('cat-file','-t',$blob))).Trim() -cne 'blob') { throw "发布输入不是普通 Git blob：$Source" }
+    $bytes = Read-GitBytes @('cat-file','blob',$blob)
+    $path = Assert-NoReparsePoint (Join-Path $workspace $Source)
+    [void](Get-RequiredHash $path)
+    $actualBytes = [IO.File]::ReadAllBytes($path)
+    # 两个哈希分别对应原始来源和检出内容；仅 Wrapper JAR 按二进制处理，其余输入严格解码 UTF-8。
+    $gitHash = Get-BytesHash $bytes
+    $actualHash = Get-BytesHash $actualBytes
+    $binary = $Source.EndsWith('.jar',[StringComparison]::Ordinal)
+    $text = if ($binary) { $null } else { $utf8.GetString($bytes) }
+    # Windows 检出可改变 CRLF；仅容许这一差异，原始 Git/工作区哈希分别保留。
+    if ($actualHash -cne $gitHash) {
+        if ($binary -or $utf8.GetString($actualBytes).Replace(([string][char]13 + [char]10),[string][char]10) -cne $text.Replace(([string][char]13 + [char]10),[string][char]10)) { throw "工作区输入不对应 ExpectedCommit：$Source" }
+    }
+    $snapshotEntries.Add([pscustomobject]@{ Source=$Source; GitBlob=$blob; SourceSha256=$gitHash; WorktreeSha256=$actualHash; LineEndingsDiffer=($actualHash -cne $gitHash) })
+    # 缓存对象只持有提交内容，后续示例抽取不会再次从可变工作区取文本。
+    $frozen = [pscustomobject]@{ Source=$Source; GitBlob=$blob; SourceSha256=$gitHash; Text=$text }
+    $frozenSources[$Source] = $frozen
+    return $frozen
+}
+
+# 将入口文档绑定到 DocumentationVersion；实际下载版本仍由 Version 单独控制，SHA 轮不会请求候选标签。
+function Assert-DocumentationVersion {
+    # 两个入口逐一检查唯一标记、全部模块坐标及精确 Release 链接，结果写入本轮检查集合。
+    foreach ($source in @('README.md','docs/使用文档.md')) {
+        $frozen = Get-FrozenSource $source
+        $markers = [regex]::Matches($frozen.Text,'<!-- release-documentation-version: ([^ ]+) -->')
+        if ($markers.Count -ne 1 -or $markers[0].Groups[1].Value -cne $DocumentationVersion) { throw "候选文档版本标记缺失、重复或不同：$source" }
+        $coordinates = [regex]::Matches($frozen.Text,'com\.github\.Atian10\.log-record:(log-core|log-desktop|log-android):([^''"\s\x60]+)')
+        # 按模块去重，既拒绝旧版本/占位坐标，也防止删除整个平台说明后空集合通过。
+        $seenModules = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($coordinate in $coordinates) {
+            if ($coordinate.Groups[2].Value -cne $DocumentationVersion) { throw "当前接入文档仍有不同版本或占位坐标：$source" }
+            [void]$seenModules.Add($coordinate.Groups[1].Value)
+        }
+        foreach ($module in @('log-android','log-desktop')) { if (!$seenModules.Contains($module)) { throw "文档缺少平台接入坐标：$source/$module" } }
+        if (!$frozen.Text.Contains("https://github.com/Atian10/log-record/releases/tag/$DocumentationVersion")) { throw "文档缺少精确版本 Release 入口：$source" }
+        $checks.Add([pscustomobject]@{ Check='DocumentationVersion'; Source=$source; GitBlob=$frozen.GitBlob; SourceSha256=$frozen.SourceSha256; DocumentationVersion=$DocumentationVersion; RequestedArtifactVersion=$Version })
+    }
+}
+
+# Module 决定原始示例清单；Class/Parameters 仅补齐编译外壳，FullClass 表示原文已包含完整类。
+function Get-ExampleSpecs([string]$Module) {
+    if ($Module -eq 'log-android') {
+        return @(
+            [pscustomobject]@{Source='docs/使用文档.md';Marker='android-init';Class='MyApp';Language='java';Parameters='';FullClass=$true},
+            [pscustomobject]@{Source='docs/使用文档.md';Marker='android-manifest';Class='';Language='xml';Parameters='';FullClass=$false},
+            [pscustomobject]@{Source='README.md';Marker='readme-android-init';Class='ReadmeExample';Language='java';Parameters='';FullClass=$false},
+            [pscustomobject]@{Source='log-android/src/main/java/com/atian10/logrecord/android/AndroidLogInit.java';Marker='javadoc-init';Class='AndroidJavadocExample';Language='java';Parameters='Context context';FullClass=$false},
+            [pscustomobject]@{Source='docs/使用文档.md';Marker='exception-query';Class='QueryExample';Language='java';Parameters='long startTime, long endTime';FullClass=$false},
+            [pscustomobject]@{Source='docs/使用文档.md';Marker='android-export';Class='ExportExample';Language='java';Parameters='Context context';FullClass=$false}
+        )
+    }
+    if ($Module -eq 'log-desktop') {
+        return @([pscustomobject]@{Source='log-desktop/src/main/java/com/atian10/logrecord/desktop/DesktopLogInit.java';Marker='javadoc-init';Class='DesktopJavadocExample';Language='java';Parameters='';FullClass=$false})
+    }
+    return @()
+}
+
+# Spec 来自固定清单；从提交原文提取唯一示例，保留正文，不改写 API 调用或执行其中方法。
+function Get-FrozenSnippet($Spec) {
+    # source 持有冻结内容，matches/text 分别保存唯一抽取匹配及原始正文。
+    $source = Get-FrozenSource $Spec.Source
+    if ($Spec.Marker -eq 'javadoc-init') {
+        $matches = [regex]::Matches($source.Text,'(?s)<pre>\s*\r?\n(.*?)\r?\n\s*\*\s*</pre>')
+        if ($matches.Count -ne 1) { throw "Javadoc 初始化示例必须唯一：$($Spec.Source)" }
+        $text = ([regex]::Replace($matches[0].Groups[1].Value,'(?m)^\s*\* ?','')).Trim()
+    } else {
+        # 三反引号与精确标记共同限定代码块；语言必须与清单声明一致。
+        $fence = ([string][char]96) * 3
+        $marker = '<!-- verification:' + $Spec.Marker + ' -->'
+        if ([regex]::Matches($source.Text,[regex]::Escape($marker)).Count -ne 1) { throw "示例标记缺失或重复：$($Spec.Source)/$($Spec.Marker)" }
+        $pattern = '(?s)' + [regex]::Escape($marker) + '\s*' + $fence + $Spec.Language + '\s*\r?\n(.*?)\r?\n' + $fence
+        $matches = [regex]::Matches($source.Text,$pattern)
+        if ($matches.Count -ne 1) { throw "标记后的示例围栏无效：$($Spec.Source)/$($Spec.Marker)" }
+        $text = $matches[0].Groups[1].Value
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { throw '原始示例为空。' }
+    return [pscustomobject]@{Source=$Spec.Source;Marker=$Spec.Marker;Language=$Spec.Language;GitBlob=$source.GitBlob;SourceSha256=$source.SourceSha256;Text=$text}
+}
+
+# 返回隔离消费者内的生成路径；Android 包目录必须与 namespace 和 MyApp 注册相同。
+function Get-ExampleFile([string]$ConsumerRoot, [string]$Module, $Spec) {
+    if ($Spec.Language -eq 'xml') { return Join-Path $ConsumerRoot 'src/main/AndroidManifest.xml' }
+    # XML 沿用主 Manifest 路径；Java 以平台包目录组织，禁止不同示例覆盖同一类。
+    $directory = if ($Module -eq 'log-android') { 'src/main/java/com/atian10/logrecord/remoteverification' } else { 'src/main/java' }
+    return Join-Path $ConsumerRoot "$directory/$($Spec.Class).java"
+}
+
+# 在 ConsumerRoot 生成 Module 的原文示例和来源收据；只增加 imports、类和方法外壳，不运行初始化。
+function New-FrozenExamples([string]$ConsumerRoot, [string]$Module) {
+    # 通用 imports 让文档中的短类型名可直接编译；平台类型另外加入前缀。
+    $imports = @'
+import com.atian10.logrecord.core.*;
+import com.atian10.logrecord.core.config.*;
+import com.atian10.logrecord.core.model.*;
+import com.atian10.logrecord.core.query.*;
+import com.atian10.logrecord.core.export.*;
+import java.io.File;
+import java.util.List;
+'@
+    # 生成器统一使用 LF；records 保存每个示例的原文、来源和生成文件哈希。
+    $nl = [string][char]10
+    $records = @()
+    # spec/snippet/target 分别是固定声明、提交原文及隔离输出，prefix/suffix 只包裹正文。
+    foreach ($spec in @(Get-ExampleSpecs $Module)) {
+        $snippet = Get-FrozenSnippet $spec
+        $target = Get-ExampleFile $ConsumerRoot $Module $spec
+        $prefix = ''; $suffix = ''
+        if ($spec.Language -eq 'java') {
+            $prefix = if ($Module -eq 'log-android') {
+                'package com.atian10.logrecord.remoteverification;' + $nl + 'import android.app.Application;' + $nl + 'import android.content.Context;' + $nl + 'import com.atian10.logrecord.android.AndroidLogInit;' + $nl + $imports + $nl
+            } else { $imports + $nl + 'import com.atian10.logrecord.desktop.DesktopLogInit;' + $nl }
+            if (!$spec.FullClass) {
+                # Android 片段允许原样使用 this；完整 MyApp 类不再重复包裹。
+                $extends = if ($Module -eq 'log-android') { ' extends Application' } else { '' }
+                $prefix += 'public final class ' + $spec.Class + $extends + ' {' + $nl + '    /** 仅编译原始示例；参数提供外部上下文，本验证不调用此方法。 */' + $nl + '    public void example(' + $spec.Parameters + ') {' + $nl
+                $suffix = $nl + '    }' + $nl + '}' + $nl
+            }
+        }
+        Write-RunText $target ($prefix + $snippet.Text + $suffix)
+        $records += [pscustomobject]@{Source=$snippet.Source;Marker=$snippet.Marker;Language=$snippet.Language;GitBlob=$snippet.GitBlob;SourceSha256=$snippet.SourceSha256;Snippet=$snippet.Text;GeneratedFile=$target;GeneratedSha256=(Get-RequiredHash $target)}
+    }
+    Write-RunText (Join-Path $ConsumerRoot 'documentation-examples.json') (ConvertTo-Json -InputObject $records -Depth 6)
+}
+
+# Path 必须在当前验证目录；只读 class 魔数和 major version，返回哈希与未执行声明。
+function Get-CompiledClassEvidence([string]$Path) {
+    $path = Assert-RunPath $Path
+    # 只读取 class 的八字节头部；55 对应 Java 11，不加载或实例化该类。
+    $stream = [IO.File]::OpenRead($path)
+    try {
+        $header = [byte[]]::new(8)
+        if ($stream.Read($header,0,8) -ne 8 -or [BitConverter]::ToString($header,0,4) -cne 'CA-FE-BA-BE' -or ([int]$header[6]*256+[int]$header[7]) -ne 55) { throw "消费者没有生成 Java 11 class：$path" }
+    } finally { $stream.Dispose() }
+    return [pscustomobject]@{Path=$path;Sha256=(Get-RequiredHash $path);Bytes=(Get-Item -LiteralPath $path).Length;Executed=$false}
+}
+
+# 对指定消费者逐项核对原文、生成收据和编译输出；XML 来源与 Java 编译证据分开记录。
+function Assert-FrozenExamples([string]$ConsumerRoot, [string]$Mode, [string]$Module) {
+    # 清单是预期集合，收据是生成时保存的证据；每个 Source/Marker 必须唯一匹配。
+    $specs = @(Get-ExampleSpecs $Module)
+    $records = @(Get-Content -LiteralPath (Join-Path $ConsumerRoot 'documentation-examples.json') -Raw | ConvertFrom-Json)
+    if ($records.Count -ne $specs.Count) { throw '原始示例收据数量不同。' }
+    foreach ($spec in $specs) {
+        $matched = @($records | Where-Object { $_.Source -ceq $spec.Source -and $_.Marker -ceq $spec.Marker })
+        if ($matched.Count -ne 1) { throw "原始示例收据缺失或重复：$Mode/$Module/$($spec.Marker)" }
+        # 独立重取冻结片段及目标路径，避免只相信收据自述。
+        $record = $matched[0]
+        $snippet = Get-FrozenSnippet $spec
+        $generated = Get-ExampleFile $ConsumerRoot $Module $spec
+        if ($record.Language -cne $spec.Language -or $record.GitBlob -cne $snippet.GitBlob -or $record.SourceSha256 -cne $snippet.SourceSha256 -or $record.Snippet -cne $snippet.Text -or
+            $record.GeneratedFile -cne $generated -or $record.GeneratedSha256 -cne (Get-RequiredHash $generated) -or !(Get-Content -LiteralPath $generated -Raw).Contains($snippet.Text)) { throw '示例来源或生成内容不对应冻结提交。' }
+        if ($spec.Language -eq 'xml') {
+            $checks.Add([pscustomobject]@{Check='DocumentationManifest';Mode=$Mode;Module=$Module;Source=$spec.Source;Marker=$spec.Marker;GitBlob=$snippet.GitBlob;SourceSha256=$snippet.SourceSha256;GeneratedFile=$generated;GeneratedSha256=$record.GeneratedSha256;Executed=$false})
+        } else {
+            # 检查编译器实际输出位置，并验证 class 为 Java 11；不会运行生成的方法。
+            $classDirectory = if ($Module -eq 'log-android') { 'build/intermediates/javac/debug/classes/com/atian10/logrecord/remoteverification' } else { 'build/classes/java/main' }
+            $compiled = Get-CompiledClassEvidence (Join-Path $ConsumerRoot "$classDirectory/$($spec.Class).class")
+            $checks.Add([pscustomobject]@{Check='DocumentationCompilation';Mode=$Mode;Module=$Module;Source=$spec.Source;Marker=$spec.Marker;GitBlob=$snippet.GitBlob;SourceSha256=$snippet.SourceSha256;GeneratedFile=$generated;GeneratedSha256=$record.GeneratedSha256;CompiledClass=$compiled})
+        }
+    }
+}
+
+# 读取三种宿主策略的真实合并产物；省略必须无属性，明确 false 不能替代省略。
+function Assert-RemoteManifestCases([string]$ConsumerRoot, [string]$Mode) {
+    # records 保留合并证据；case 的 null 代表宿主未指定备份策略。
+    $records = @()
+    foreach ($case in @(@{Variant='backupTrue';Value='true'},@{Variant='backupFalse';Value='false'},@{Variant='backupOmitted';Value=$null})) {
+        $path = Assert-RunPath (Join-Path $ConsumerRoot "build/intermediates/merged_manifest/$($case.Variant)/AndroidManifest.xml")
+        [xml]$manifest = Get-Content -LiteralPath $path -Raw
+        $application = $manifest.SelectSingleNode('/manifest/application')
+        if (!$application) { throw '合并 Manifest 缺少 application。' }
+        # 属性存在性、值与 Application 全名分别检查，避免空字符串或其他 Application 蒙混通过。
+        $present = $application.HasAttribute('allowBackup','http://schemas.android.com/apk/res/android')
+        $value = $application.GetAttribute('allowBackup','http://schemas.android.com/apk/res/android')
+        $name = $application.GetAttribute('name','http://schemas.android.com/apk/res/android')
+        if (($null -eq $case.Value -and $present) -or ($null -ne $case.Value -and (!$present -or $value -cne $case.Value)) -or $name -cne 'com.atian10.logrecord.remoteverification.MyApp') { throw "实际 Manifest 与宿主选择或 MyApp 注册不同：$Mode/$($case.Variant)" }
+        # 同一条证据同时写入消费者收据和总检查集合，ApplicationExecuted 始终为 false。
+        $record = [pscustomobject]@{Check='ConsumerManifest';Mode=$Mode;Module='log-android';Variant=$case.Variant;Expected=$case.Value;HasAllowBackup=$present;Actual=$value;Application=$name;Path=$path;Sha256=(Get-RequiredHash $path);ApplicationExecuted=$false}
+        $records += $record
+        $checks.Add($record)
+    }
+    Write-RunText (Join-Path $ConsumerRoot 'manifest-cases.json') (ConvertTo-Json -InputObject $records -Depth 5)
+}
+
+# Check 选取证据类别，Fields 定义身份字段；要求复合键集合完整且唯一，不以总数量代替覆盖检查。
+function Assert-CheckSet([string]$Check, [string[]]$Fields, [string[]]$ExpectedKeys) {
+    # records 是待验收记录，actual 保存区分大小写的复合键，拒绝重复后再检查预期集合。
+    $records = @($checks | Where-Object { $_.Check -ceq $Check })
+    $actual = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($record in $records) {
+        $key = (@($Fields | ForEach-Object { [string]$record.$_ }) -join '|')
+        if (!$actual.Add($key)) { throw "验收项重复：$Check/$key" }
+    }
+    if ($records.Count -ne $ExpectedKeys.Count) { throw "验收项集合大小不同：$Check" }
+    foreach ($key in $ExpectedKeys) { if (!$actual.Contains($key)) { throw "缺少必需验收项：$Check/$key" } }
+}
+
+# 汇总冻结来源、九项制品、六消费者及示例/Manifest 证据；任何缺项均不能报告整轮通过。
+function Assert-CompleteMatrix {
+    Assert-CheckSet 'SourceIdentity' @('ExpectedCommit') @($ExpectedCommit)
+    Assert-CheckSet 'DocumentationVersion' @('Source') @('README.md','docs/使用文档.md')
+    foreach ($check in @('RemotePublication','MetadataAbsent','SourceContents')) { Assert-CheckSet $check @('Module') $modules }
+    Assert-CheckSet 'ConsumerBom' @('Mode') @('DefaultMaven','PomOnly')
+    Assert-CheckSet 'LibraryBackupPolicyAbsent' @('Module') @('log-android')
+    # 以解析模式和固定模块/示例声明展开预期身份，避免同一消费者的重复记录填补缺项。
+    $consumerKeys = @(); $javaKeys = @(); $xmlKeys = @(); $manifestKeys = @()
+    foreach ($mode in @('DefaultMaven','PomOnly')) {
+        foreach ($module in $modules) {
+            $consumerKeys += "$mode|$module"
+            foreach ($spec in @(Get-ExampleSpecs $module)) {
+                $key = "$mode|$module|$($spec.Source)|$($spec.Marker)"
+                if ($spec.Language -eq 'java') { $javaKeys += $key } else { $xmlKeys += $key }
+            }
+        }
+        foreach ($variant in @('backupTrue','backupFalse','backupOmitted')) { $manifestKeys += "$mode|$variant" }
+    }
+    Assert-CheckSet 'Consumer' @('Mode','Module') $consumerKeys
+    Assert-CheckSet 'DocumentationCompilation' @('Mode','Module','Source','Marker') $javaKeys
+    Assert-CheckSet 'DocumentationManifest' @('Mode','Module','Source','Marker') $xmlKeys
+    Assert-CheckSet 'CoreApiCompilation' @('Mode') @('DefaultMaven','PomOnly')
+    Assert-CheckSet 'ConsumerManifest' @('Mode','Variant') $manifestKeys
+    if ($javaKeys.Count -ne 12 -or $xmlKeys.Count -ne 2) { throw '六段 Java 示例与 XML 清单定义不完整。' }
 }
 
 function Assert-SourceContents($Zip, [string]$Module, [string]$ArchivePath) {
@@ -356,6 +595,11 @@ function Assert-RemotePublication([string]$Module) {
     try {
         if ($Module -eq 'log-android') {
             if ((Read-ZipEntryText $zip 'AndroidManifest.xml') -notmatch 'minSdkVersion="21"') { throw '远端 AAR minSdk 不是 21。' }
+            # 检查实际 AAR 内的应用属性；无 application 节点同样表示库未指定备份策略。
+            [xml]$libraryManifest = Read-ZipEntryText $zip 'AndroidManifest.xml'
+            $libraryApplication = $libraryManifest.SelectSingleNode('/manifest/application')
+            if ($libraryApplication -and $libraryApplication.HasAttribute('allowBackup','http://schemas.android.com/apk/res/android')) { throw '远端 AAR 不得决定宿主 allowBackup。' }
+            $checks.Add([pscustomobject]@{Check='LibraryBackupPolicyAbsent';Module=$Module;BinarySha256=(Get-RequiredHash $files.binary);HasAllowBackup=$false})
             if ((Read-ZipEntryText $zip 'proguard.txt') -notmatch 'com\.atian10\.logrecord\.android\.room\.\*\*') { throw '远端 AAR 缺少 Room consumer rules。' }
             $entry = $zip.GetEntry('classes.jar')
             if (!$entry -or $entry.Length -gt 134217728) { throw 'AAR 的 classes.jar 缺失或过大。' }
@@ -405,7 +649,12 @@ android {
     compileOptions { sourceCompatibility JavaVersion.VERSION_11; targetCompatibility JavaVersion.VERSION_11 }
     // 调试签名位于当前消费者目录，Release 保持未签名。
     signingConfigs { debug { storeFile file('android-user/debug.keystore') } }
-    buildTypes { release { minifyEnabled true; proguardFiles getDefaultProguardFile('proguard-android-optimize.txt') } }
+    buildTypes {
+        backupTrue { initWith debug; matchingFallbacks = ['debug'] }
+        backupFalse { initWith debug; matchingFallbacks = ['debug'] }
+        backupOmitted { initWith debug; matchingFallbacks = ['debug'] }
+        release { minifyEnabled true; proguardFiles getDefaultProguardFile('proguard-android-optimize.txt') }
+    }
 }
 '@
     } else {
@@ -483,21 +732,41 @@ gradle.taskGraph.whenReady { graph ->
     Write-RunText (Join-Path $consumer 'gradle.properties') "android.useAndroidX=true`norg.gradle.java.installations.auto-download=false`norg.gradle.java.installations.auto-detect=false`nandroid.builder.sdkDownload=false`n"
     if ($Module -eq 'log-android') {
         Write-RunText (Join-Path $consumer 'local.properties') ('sdk.dir=' + $SdkDirectory.Replace('\','/'))
-        Write-RunText (Join-Path $consumer 'src/main/AndroidManifest.xml') '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:name=".ConsumerApplication" android:label="Remote verification" /></manifest>'
-        Write-RunText (Join-Path $consumer 'src/main/java/com/atian10/logrecord/remoteverification/ConsumerApplication.java') @'
-package com.atian10.logrecord.remoteverification;
-import android.app.Application;
-import com.atian10.logrecord.core.config.LogConfig;
-import com.atian10.logrecord.android.AndroidLogInit;
-/** 仅供编译和 R8 检查，验证入口绝不安装或运行此应用。 */
-public final class ConsumerApplication extends Application {
-    /** Manifest 入口保留实际 API 引用；此方法在验证期间不会执行。 */
-    @Override public void onCreate() { super.onCreate(); AndroidLogInit.init(this, new LogConfig.Builder()); }
-}
-'@
+        New-FrozenExamples $consumer $Module
+        # 仅 true/false 用例添加宿主覆盖；省略用例使用原始主 Manifest，不生成 allowBackup。
+        foreach ($case in @(@{Variant='backupTrue';Value='true'},@{Variant='backupFalse';Value='false'})) {
+            $overlay = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:allowBackup="' + $case.Value + '" /></manifest>'
+            Write-RunText (Join-Path $consumer "src/$($case.Variant)/AndroidManifest.xml") $overlay
+        }
     } else {
         $source = if ($Module -eq 'log-desktop') { 'public static void configure(String path) { com.atian10.logrecord.desktop.DesktopLogInit.init(path, new com.atian10.logrecord.core.config.LogConfig.Builder()); }' } else { 'public static com.atian10.logrecord.core.config.LogConfig.Builder configure() { return new com.atian10.logrecord.core.config.LogConfig.Builder(); }' }
         Write-RunText (Join-Path $consumer 'src/main/java/Consumer.java') ("/** 仅供编译检查，不运行初始化。 */`npublic final class Consumer { /** 核对公开 API 与传递依赖。 */ $source }")
+    }
+    if ($Module -eq 'log-desktop') { New-FrozenExamples $consumer $Module }
+    if ($Module -eq 'log-core') {
+        # 参数式源码只让 javac 核对公开签名；不创建控制台替身、不提供真实日志或调用该方法。
+        $proof = @'
+import com.atian10.logrecord.core.IConsoleOutput;
+import com.atian10.logrecord.core.IFormatter;
+import com.atian10.logrecord.core.LogManager;
+import com.atian10.logrecord.core.config.LogConfig;
+import com.atian10.logrecord.core.model.LogRecord;
+import com.atian10.logrecord.core.model.ExceptionRecord;
+/** 仅编译公开签名；不实例化 Fake、不运行初始化或输出方法。 */
+public final class ConsoleApiExample {
+    /** 参数仅用于匹配 init/print 的公开类型与重载；本验证不调用此方法。 */
+    public static void signatures(LogConfig config, IConsoleOutput output,
+            LogRecord log, ExceptionRecord exception, IFormatter formatter) {
+        LogManager.init(config, output);
+        output.print(log, formatter);
+        output.print(exception, formatter);
+    }
+}
+'@
+        # 保存源码输出及脚本 blob，使核心签名证据能够回溯到同一个冻结提交。
+        $proofPath = Join-Path $consumer 'src/main/java/ConsoleApiExample.java'
+        Write-RunText $proofPath $proof
+        Write-RunText (Join-Path $consumer 'core-api-example.json') (ConvertTo-Json -InputObject ([pscustomobject]@{Source=$proofPath;Sha256=(Get-RequiredHash $proofPath);ScriptGitBlob=(Get-FrozenSource 'scripts/verify-jitpack-consumer.ps1').GitBlob;Executed=$false}))
     }
     return $consumer
 }
@@ -549,6 +818,19 @@ function Assert-ConsumerBom([string]$ConsumerRoot, [string]$Mode) {
 function Assert-ConsumerOutputs([string]$ConsumerRoot, [string]$Mode, [string]$Module) {
     # 报告同时绑定编译/打包输出内容，不能只凭依赖图文件证明本轮消费完成。
     $outputPaths = [Collections.Generic.List[string]]::new()
+    if ($Module -eq 'log-core') {
+        # proof/source/class 分别核对生成收据、源码与实际编译输出，三者必须对应同一运行。
+        $proof = Get-Content -LiteralPath (Join-Path $ConsumerRoot 'core-api-example.json') -Raw | ConvertFrom-Json
+        $source = Join-Path $ConsumerRoot 'src/main/java/ConsoleApiExample.java'
+        if ($proof.Source -cne $source -or $proof.Sha256 -cne (Get-RequiredHash $source) -or $proof.Executed -ne $false -or
+            $proof.ScriptGitBlob -cne (Get-FrozenSource 'scripts/verify-jitpack-consumer.ps1').GitBlob) { throw '核心公开签名示例身份不同。' }
+        $class = Get-CompiledClassEvidence (Join-Path $ConsumerRoot 'build/classes/java/main/ConsoleApiExample.class')
+        $checks.Add([pscustomobject]@{Check='CoreApiCompilation';Mode=$Mode;Module=$Module;Source=$source;SourceSha256=$proof.Sha256;ScriptGitBlob=$proof.ScriptGitBlob;CompiledClass=$class})
+        $outputPaths.Add((Join-Path $ConsumerRoot 'core-api-example.json'))
+    } else {
+        Assert-FrozenExamples $ConsumerRoot $Mode $Module
+        $outputPaths.Add((Join-Path $ConsumerRoot 'documentation-examples.json'))
+    }
     $reportPath = Join-Path $ConsumerRoot 'resolved-artifacts.json'
     [void](Get-RequiredHash $reportPath)
     $outputPaths.Add($reportPath)
@@ -571,6 +853,8 @@ function Assert-ConsumerOutputs([string]$ConsumerRoot, [string]$Mode, [string]$M
         $outputPaths.Add($metadataFiles[0].FullName)
     }
     if ($Module -eq 'log-android') {
+        Assert-RemoteManifestCases $ConsumerRoot $Mode
+        $outputPaths.Add((Join-Path $ConsumerRoot 'manifest-cases.json'))
         Assert-ConsumerBom $ConsumerRoot $Mode
         $outputPaths.Add((Join-Path $ConsumerRoot 'bom-evidence.json'))
         foreach ($variant in @('debug','release')) {
@@ -602,18 +886,40 @@ if (Test-Path -LiteralPath $runRoot) { throw 'RunId 已存在，禁止重用旧�
 $JavaHome = (Resolve-Path -LiteralPath $JavaHome).Path
 $SdkDirectory = (Resolve-Path -LiteralPath $SdkDirectory).Path
 $gitPath = (Get-Command git -CommandType Application -ErrorAction Stop).Source
-$inputPaths = @($PSCommandPath,(Join-Path $workspace 'jitpack.yml'),(Join-Path $workspace 'LICENSE'),
-    (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.jar'),(Join-Path $workspace 'gradle/wrapper/gradle-wrapper.properties'),
+if ([IO.Path]::GetFullPath($PSCommandPath) -cne [IO.Path]::GetFullPath((Join-Path $workspace 'scripts/verify-jitpack-consumer.ps1'))) { throw '必须使用冻结提交中的仓库脚本入口。' }
+if ($utf8.GetString((Read-GitBytes @('cat-file','-t',$ExpectedCommit))).Trim() -cne 'commit' -or $utf8.GetString((Read-GitBytes @('rev-parse','HEAD'))).Trim() -cne $ExpectedCommit) { throw 'HEAD 必须为 ExpectedCommit 的精确提交。' }
+if ($Version -ceq $DocumentationVersion -and $utf8.GetString((Read-GitBytes @('rev-parse',("refs/tags/$Version" + '^{commit}')))).Trim() -cne $ExpectedCommit) { throw '标签未指向 ExpectedCommit。' }
+# 列明影响发布契约及生成示例的源码输入；逐一匹配 S，随后将工作区原始哈希纳入结束复查。
+$sourcePaths = @(
+    'scripts/verify-jitpack-consumer.ps1','README.md','CHANGELOG.md','docs/使用文档.md',
+    'docs/公开发布说明.md','docs/日志记录库-架构设计文档.md','docs/日志记录库-功能设计文档.md',
+    'build.gradle','settings.gradle','gradle.properties','jitpack.yml','LICENSE','gradlew',
+    'gradle/wrapper/gradle-wrapper.jar','gradle/wrapper/gradle-wrapper.properties',
+    'log-core/build.gradle','log-desktop/build.gradle','log-android/build.gradle',
+    'log-android/src/main/AndroidManifest.xml',
+    'log-android/src/main/java/com/atian10/logrecord/android/AndroidLogInit.java',
+    'log-desktop/src/main/java/com/atian10/logrecord/desktop/DesktopLogInit.java',
+    'log-core/src/main/java/com/atian10/logrecord/core/IConsoleOutput.java'
+)
+foreach ($sourcePath in $sourcePaths) { [void](Get-FrozenSource $sourcePath) }
+Assert-DocumentationVersion
+# 在下载前确认每个原始示例唯一且非空；消费者只编译这些冻结内容。
+foreach ($module in @('log-android','log-desktop')) { foreach ($spec in @(Get-ExampleSpecs $module)) { [void](Get-FrozenSnippet $spec) } }
+if ((Get-FrozenSource 'build.gradle').Text -notmatch 'com\.android\.tools\.build:gradle:7\.4\.2') { throw '冻结提交必须保留 AGP 7.4.2。' }
+# 源码与实际工具共同进入运行前后哈希检查；任何一项发生变化都使当前证据失效。
+$inputPaths = @($sourcePaths | ForEach-Object { Join-Path $workspace $_ }) + @(
     (Join-Path $JavaHome 'release'),(Join-Path $JavaHome 'bin/java.exe'),(Join-Path $JavaHome 'bin/keytool.exe'),(Join-Path $SdkDirectory 'platforms/android-33/android.jar'),$gitPath)
 $inputs = @($inputPaths | ForEach-Object { [pscustomobject]@{ Path=$_; Sha256=(Get-RequiredHash $_) } })
 if ((Get-Content -LiteralPath (Join-Path $JavaHome 'release') -Raw) -notmatch 'JAVA_VERSION="11\.') { throw '必须使用已有 JDK 11。' }
 $wrapperProperties = Get-Content -LiteralPath (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.properties') -Raw
 if ($wrapperProperties -notmatch '(?m)^distributionUrl=https\\://services\.gradle\.org/distributions/gradle-7\.5-all\.zip\s*$' -or $wrapperProperties -notmatch '(?m)^distributionSha256Sum=[a-fA-F0-9]{64}\s*$') { throw 'Wrapper 必须固定官方 Gradle 7.5 并具备分发校验值。' }
 $licenseText = ((Get-Content -LiteralPath (Join-Path $workspace 'LICENSE') -Raw) -replace "`r`n","`n").Trim()
-if ($utf8.GetString((Read-GitBytes @('cat-file','-t',$ExpectedCommit))).Trim() -cne 'commit') { throw 'ExpectedCommit 必须对应本地已有的精确提交对象。' }
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $runRoot 'logs')) | Out-Null
-$state = [ordered]@{ State='RUNNING'; MetadataPolicy='MavenPom'; ConsumerModes=@('DefaultMaven','PomOnly'); DefinitionVersion='pom-publication-v1'; Version=$Version; ExpectedCommit=$ExpectedCommit; StartedUtc=[DateTime]::UtcNow; Inputs=$inputs; Error=$null; RemoteCancellation='客户端取消或失败不代表服务端停止，也不撤销已发布制品。' }
+# 分别记录请求制品版本、源码文档版本及 v2 验收定义，禁止将旧矩阵收据解释成新增检查通过。
+$state = [ordered]@{ State='RUNNING'; MetadataPolicy='MavenPom'; ConsumerModes=@('DefaultMaven','PomOnly'); DefinitionVersion='pom-publication-v2'; Version=$Version; DocumentationVersion=$DocumentationVersion; ExpectedCommit=$ExpectedCommit; StartedUtc=[DateTime]::UtcNow; Inputs=$inputs; SourceInputs=@($snapshotEntries.ToArray()); Error=$null; RemoteCancellation='客户端取消或失败不代表服务端停止，也不撤销已发布制品。' }
+Write-RunJson 'source-inputs.json' @($snapshotEntries.ToArray())
+$checks.Add([pscustomobject]@{Check='SourceIdentity';ExpectedCommit=$ExpectedCommit;DocumentationVersion=$DocumentationVersion;SourceInputs=@($snapshotEntries.ToArray())})
 Write-RunJson 'run.json' $state
 $remoteLog = $null
 try {
@@ -644,18 +950,14 @@ try {
                 # 仅生成本轮临时调试签名，不读取个人或正式签名。
                 $keyArguments = @(('-J-Duser.home=' + (Join-Path $consumer 'user-home')),'-genkeypair','-noprompt','-keystore',(Join-Path $consumer 'android-user/debug.keystore'),'-storepass','android','-alias','androiddebugkey','-keypass','android','-dname','CN=Android Debug,O=Android,C=US','-keyalg','RSA','-validity','30')
                 Invoke-ConsumerProcess "$mode-$module-key" (Join-Path $JavaHome 'bin/keytool.exe') $keyArguments $consumer
-                Invoke-ConsumerGradle "$mode-$module-build" $consumer @('assembleDebug','assembleRelease','verifyRuntimeGraph')
+                Invoke-ConsumerGradle "$mode-$module-build" $consumer @('assembleDebug','assembleRelease','processBackupTrueMainManifest','processBackupFalseMainManifest','processBackupOmittedMainManifest','verifyRuntimeGraph')
             } else { Invoke-ConsumerGradle "$mode-$module-build" $consumer @('classes','verifyRuntimeGraph') }
             Assert-ConsumerOutputs $consumer $mode $module
             Write-RunJson 'checks.json' @($checks.ToArray())
         }
     }
     foreach ($input in $inputs) { if ((Get-RequiredHash $input.Path) -cne $input.Sha256) { throw '验证期间脚本、工具或基准许可证发生变化。' } }
-    if (@($checks | Where-Object { $_.Check -eq 'Consumer' }).Count -ne 6 -or
-        @($checks | Where-Object { $_.Check -eq 'RemotePublication' }).Count -ne 3 -or
-        @($checks | Where-Object { $_.Check -eq 'MetadataAbsent' }).Count -ne 3 -or
-        @($checks | Where-Object { $_.Check -eq 'SourceContents' }).Count -ne 3 -or
-        @($checks | Where-Object { $_.Check -eq 'ConsumerBom' }).Count -ne 2) { throw 'POM 发布与六消费者验证矩阵不完整。' }
+    Assert-CompleteMatrix
     $state.State = 'PASSED'
 } catch {
     $firstFailure = $_

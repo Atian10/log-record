@@ -2,9 +2,15 @@
 
 本文件记录代码及发布准备的变更。设计文档中的 `v1.5` 是历史文档版号，不代表 Git 标签、Maven 版本或已经发布的制品。
 
-## Unreleased
+## v2.0.0-rc.2
 
-当前六项修复已在本地完成，尚未发布。离线批次 `20260913-six-fixes-local-r2` 的 Environment、Publish、Consumers、PublicationArtifacts 四阶段全部通过；10 条命令退出 0，六个独立消费者、12 项文档/Javadoc 示例编译、6 项 Manifest 合并和 108 条制品检查记录通过。未运行应用、初始化方法、数据库、测试或设备，控制台动态行为仍未运行验收。下方 `v2.0.0-rc.1` 坐标与历史验收保持不变，旧版本仍含本次针对的问题，不能从该坐标取得本地修复。
+本文对应 `v2.0.0-rc.2` 的源码与接口；发布状态、精确提交和验证结论以该版本 [Release](https://github.com/Atian10/log-record/releases/tag/v2.0.0-rc.2) 为准。接入前确认其已公布通过结果。
+
+本条记录本版本的六项修复与文档／远端验收契约调整，不预写发布日期、提交 SHA 或通过状态。
+
+### 修复前后及历史本地验证
+
+六项修复的历史离线批次 `20260913-six-fixes-local-r2` 完成 Environment、Publish、Consumers、PublicationArtifacts 四阶段；10 条命令退出 0，六个独立消费者、12 项文档/Javadoc 示例编译、6 项 Manifest 合并和 108 条制品检查记录通过。它对应当时输入，不是 rc.2 文档及新 P5 定义的结果。未运行应用、初始化、数据库、测试或设备，控制台动态行为仍未运行验收。旧 `v2.0.0-rc.1` 坐标与验收保持历史含义。
 
 首轮 `20260913-six-fixes-local-r1` 的六消费者构建通过，但最后检查器因 PowerShell 将单元素数组解包为字符串而失败；修正集合声明后使用新 RunId 完整复验。首轮 FAILED 收据及日志保留，不覆盖为通过。
 
@@ -13,7 +19,8 @@
 - 新增核心 `IConsoleOutput` 与 `LogManager.init(config, strategy)`。默认平台入口直接注入数据库和输出策略，`LogManager` 按次快照统一处理控制台开关；支持初始 true／false 后双向切换，不再默认套用存储装饰器或强制 false。
 - formatter 非空时控制台用 TXT，null 恢复平台默认文本；保留 tag、级别、FATAL、stdout／stderr 语义。提交引擎后在调用线程同步输出，普通运行时异常进入 warning 且不回退重复输出；控制台可见不代表落盘，关闭跳过新分发、不等待在途输出。旧 Storage 构造器独立使用时保留原有通道。
 - 库 Manifest 不替宿主决定 `allowBackup`，分别检查宿主 true／false／省略三种合并用例；不作设备备份恢复验证。
-- 本轮限定离线 `Environment,Publish,Consumers,PublicationArtifacts`，包含六消费者、每个 Android 消费者的三种 Manifest 合并用例、文档／Javadoc 调用提取编译。固定 AGP 7.4.2、Gradle 7.5、Java 11；不执行初始化、应用、数据库、设备、Fake、测试、全量 Lint 或远端 P5，不提交推送、不创建标签或发版。
+- 源码文档统一标识 `v2.0.0-rc.2` 并提供具体模块坐标和文件名；版本状态由该版本 Release 承载，历史标签不移动。
+- P5 使用 `DefinitionVersion=pom-publication-v2`，新增 `DocumentationVersion` 身份检查，以及原始文档/Javadoc 编译、IConsoleOutput 参数式签名编译和实际 Manifest 三种合并检查。它们是新验收要求，不能用历史六消费者结果补齐。限定执行范围和排除项见[公开发布说明](docs/公开发布说明.md)。
 
 ## v2.0.0-rc.1 — 2026-09-13（预发布）
 
