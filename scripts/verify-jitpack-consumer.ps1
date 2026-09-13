@@ -69,12 +69,12 @@ function Get-RequiredHash([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
-function Invoke-RemoteDownload([string]$RelativeUri, [string]$RelativeOutput) {
+function Invoke-RemoteDownload([string]$RelativeUri, [string]$RelativeOutput, [switch]$RequireAbsent) {
     # 每次请求总计最多十分钟；逐个记录 HTTPS 重定向，保存首错和已下载的失败证据。
     $destination = Assert-RunPath (Join-Path $runRoot $RelativeOutput)
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination)) | Out-Null
     $uri = [uri]("https://jitpack.io/$RelativeUri")
-    $record = [ordered]@{ RequestedUri=$uri.AbsoluteUri; Redirects=@(); FinalUri=$null; Status=$null; Path=$destination; Sha256=$null; Error=$null }
+    $record = [ordered]@{ RequestedUri=$uri.AbsoluteUri; StartedUtc=[DateTime]::UtcNow; CompletedUtc=$null; Redirects=@(); FinalUri=$null; Status=$null; Expectation=if ($RequireAbsent) { 'HTTP404Absence' } else { 'HTTP200Artifact' }; Path=$destination; Sha256=$null; Error=$null }
     $handler = [Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
     $client = [Net.Http.HttpClient]::new($handler)
@@ -101,6 +101,12 @@ function Invoke-RemoteDownload([string]$RelativeUri, [string]$RelativeOutput) {
                 continue
             }
             $record.FinalUri = $uri.AbsoluteUri
+            if ($RequireAbsent) {
+                # 缺席也是实测结果；权限错误、超时和服务故障绝不能冒充不存在。
+                if ($record.Status -ne 404) { throw "远端 module 缺席检查必须得到 HTTP 404，实际 HTTP $($record.Status)：$RelativeUri" }
+                $record.Path = $null
+                return
+            }
             if ($record.Status -ne 200) { throw "远端下载失败，HTTP $($record.Status)：$RelativeUri" }
             if ($response.Content.Headers.ContentLength -gt 134217728) { throw '远端制品超过 128 MiB 限制。' }
             $file = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
@@ -122,9 +128,90 @@ function Invoke-RemoteDownload([string]$RelativeUri, [string]$RelativeOutput) {
         if ($file) { $file.Dispose() }
         if ($response) { $response.Dispose() }
         $cancellation.Dispose(); $client.Dispose()
+        $record.CompletedUtc = [DateTime]::UtcNow
         $downloads.Add([pscustomobject]$record)
         Write-RunJson 'downloads.json' @($downloads.ToArray())
     }
+}
+
+function Read-GitBytes([string[]]$Arguments) {
+    # 仅读取指定提交对象；通过字节流接收 blob，避免 PowerShell 文本管道改变换行或编码。
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $gitPath; $startInfo.WorkingDirectory = $workspace
+    $startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true; $startInfo.RedirectStandardError = $true
+    foreach ($name in @('GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_REPLACE_REF_BASE','GIT_CONFIG','GIT_CONFIG_COUNT')) { [void]$startInfo.Environment.Remove($name) }
+    $startInfo.Environment['GIT_CONFIG_NOSYSTEM'] = '1'
+    $startInfo.Environment['GIT_CONFIG_GLOBAL'] = 'NUL'
+    $startInfo.Environment['GIT_NO_REPLACE_OBJECTS'] = '1'
+    $startInfo.Environment['GIT_OPTIONAL_LOCKS'] = '0'
+    foreach ($argument in (@('--no-pager','--no-replace-objects','-C',$workspace) + $Arguments)) { $startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $startInfo
+    $memory = [IO.MemoryStream]::new()
+    $cancellation = [Threading.CancellationTokenSource]::new(120000)
+    $started = $false; $failure = $null
+    try {
+        if (!$process.Start()) { throw '只读 Git 对象进程未启动。' }
+        $started = $true
+        $copy = $process.StandardOutput.BaseStream.CopyToAsync($memory,81920,$cancellation.Token)
+        $errorRead = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit(120000)) { throw '只读 Git 对象进程超过两分钟截止。' }
+        if (!$copy.Wait(10000) -or !$errorRead.Wait(10000)) { throw '只读 Git 对象输出未在截止内排空。' }
+        if ($process.ExitCode -ne 0) { throw "读取精确提交对象失败：$($errorRead.Result)" }
+        if ($memory.Length -gt 4194304) { throw '只读 Git 对象输出超过 4 MiB 限制。' }
+        return ,$memory.ToArray()
+    } catch { $failure = $_; throw
+    } finally {
+        try {
+            if ($started -and !$process.HasExited) { $process.Kill($true); if (!$process.WaitForExit(10000)) { throw '只读 Git 进程树未在回收截止内退出。' } }
+        } catch { if (!$failure) { throw }; [Console]::Error.WriteLine($_.Exception.Message) }
+        finally { $cancellation.Cancel(); $cancellation.Dispose(); $memory.Dispose(); $process.Dispose() }
+    }
+}
+
+function Get-BytesHash([byte[]]$Bytes) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hasher.ComputeHash($Bytes)).Replace('-','') } finally { $hasher.Dispose() }
+}
+
+function Assert-SourceContents($Zip, [string]$Module, [string]$ArchivePath) {
+    $prefix = "$Module/src/main/java/"
+    $treeText = $utf8.GetString((Read-GitBytes @('ls-tree','-r','-z',$ExpectedCommit,'--',"$Module/src/main/java")))
+    $expected = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $treeText.Split([char]0, [StringSplitOptions]::RemoveEmptyEntries)) {
+        if ($item -cnotmatch '^100(?:644|755) blob ([a-f0-9]{40})\t(.+)$') { throw "精确提交含不支持的源条目：$Module" }
+        $blob = $Matches[1]; $path = $Matches[2]
+        if (!$path.StartsWith($prefix,[StringComparison]::Ordinal)) { throw 'Git 源文件路径超出指定模块。' }
+        $expected.Add($path.Substring($prefix.Length),$blob)
+    }
+    if ($expected.Count -eq 0) { throw "精确提交没有主源码：$Module" }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $sources = [Collections.Generic.List[object]]::new()
+    $generated = [Collections.Generic.List[string]]::new()
+    foreach ($entry in $Zip.Entries) {
+        if ($entry.FullName.EndsWith('/')) { continue }
+        if (!$seen.Add($entry.FullName)) { throw "源码包条目重复：$Module/$($entry.FullName)" }
+        if (!$expected.ContainsKey($entry.FullName)) {
+            # 仅允许已知包装条目；任何额外生成源码必须先另列来源，不能自动接受。
+            if ($entry.FullName -ceq 'META-INF/MANIFEST.MF' -or $entry.FullName -ceq "META-INF/log-record/$Module/LICENSE") { $generated.Add($entry.FullName); continue }
+            throw "源码包有精确提交之外的条目，需核对其来源：$Module/$($entry.FullName)"
+        }
+        if ($entry.Length -gt 1048576) { throw '单个源码条目超过 1 MiB 限制。' }
+        $blob = $expected[$entry.FullName]
+        $sizeText = $utf8.GetString((Read-GitBytes @('cat-file','-s',$blob))).Trim()
+        if ($sizeText -notmatch '^\d+$' -or [long]$sizeText -gt 1048576) { throw '单个 Git 源对象大小异常。' }
+        $gitBytes = Read-GitBytes @('cat-file','blob',$blob)
+        $stream = $entry.Open(); $memory = [IO.MemoryStream]::new()
+        try { $stream.CopyTo($memory); $sourceBytes = $memory.ToArray() } finally { $memory.Dispose(); $stream.Dispose() }
+        $gitHash = Get-BytesHash $gitBytes; $sourceHash = Get-BytesHash $sourceBytes
+        if ($gitBytes.Length -ne $sourceBytes.Length -or $gitHash -cne $sourceHash) { throw "源码条目字节与精确提交不同：$Module/$($entry.FullName)" }
+        $sources.Add([pscustomobject]@{ Entry=$entry.FullName; GitPath=$prefix+$entry.FullName; GitBlob=$blob; Bytes=$sourceBytes.Length; GitContentSha256=$gitHash; SourceContentSha256=$sourceHash })
+    }
+    $missing = @($expected.Keys | Where-Object { !$seen.Contains($_) })
+    if ($missing.Count) { throw "源码包缺少精确提交条目：$Module/$($missing -join ',')" }
+    $receipt = [pscustomobject]@{ Check='SourceContents'; Module=$Module; ExpectedCommit=$ExpectedCommit; ArchiveSha256=(Get-RequiredHash $ArchivePath); Entries=@($sources.ToArray()); PackagingEntries=@($generated.ToArray()); State='PASSED' }
+    Write-RunJson "remote/$Module/source-contents.json" $receipt
+    $checks.Add($receipt)
 }
 
 function Invoke-ConsumerProcess([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$ConsumerRoot) {
@@ -231,10 +318,16 @@ function Assert-JavaClasses($Zip, [string]$Module) {
 }
 
 function Assert-RemotePublication([string]$Module) {
-    # 同时检查远端 POM、Module Metadata、源代码及二进制，避免 HTTP 200 的错误页冒充制品。
+    # 新发布契约为 Maven POM；缺席的 module 与无重定向 marker 必须有本轮证据。
     $files = $remoteArtifacts[$Module]
-    [xml]$pom = Get-Content -LiteralPath $files.pom -Raw
+    $pomText = Get-Content -LiteralPath $files.pom -Raw
+    if ($pomText -match 'published-with-gradle-metadata') { throw "远端 POM 仍含 Gradle metadata 重定向 marker：$Module" }
+    [xml]$pom = $pomText
     if ($pom.project.groupId -cne $group -or $pom.project.artifactId -cne $Module -or $pom.project.version -cne $Version) { throw "远端 POM 坐标不同：$Module" }
+    $packagingNode = $pom.SelectSingleNode("/*[local-name()='project']/*[local-name()='packaging']")
+    $packaging = if ($packagingNode) { $packagingNode.InnerText } else { 'jar' }
+    $expectedPackaging = if ($Module -eq 'log-android') { 'aar' } else { 'jar' }
+    if ($packaging -cne $expectedPackaging) { throw "远端 POM 制品类型不同：$Module" }
     if ([string]::IsNullOrWhiteSpace([string]$pom.project.name) -or [string]::IsNullOrWhiteSpace([string]$pom.project.description) -or
         $pom.project.url -cne 'https://github.com/Atian10/log-record' -or $pom.project.scm.url -cne 'https://github.com/Atian10/log-record' -or
         $pom.project.scm.connection -cne 'scm:git:https://github.com/Atian10/log-record.git') { throw "远端 POM 名称、描述或源码地址不符合约定：$Module" }
@@ -243,25 +336,21 @@ function Assert-RemotePublication([string]$Module) {
     $expected = switch ($Module) {
         'log-core' { @('com.google.code.gson:gson:2.10.1:compile') }
         'log-desktop' { @("${group}:log-core:${Version}:compile",'org.xerial:sqlite-jdbc:3.42.0.0:runtime') }
-        'log-android' { @("${group}:log-core:${Version}:compile",'androidx.room:room-runtime:2.5.2:runtime','androidx.annotation:annotation:1.6.0:runtime') }
+        'log-android' { @("${group}:log-core:${Version}:compile",'androidx.room:room-runtime:2.5.2:runtime','androidx.annotation:annotation:1.6.0:runtime','org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.0:runtime','org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.0:runtime') }
     }
     $actual = @($pom.project.dependencies.dependency | ForEach-Object { "$($_.groupId):$($_.artifactId):$($_.version):$($_.scope)" })
     if (@(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)).Count) { throw "远端 POM 依赖不同：$Module" }
     if ($Module -eq 'log-android') {
-        $bom = $pom.project.dependencyManagement.dependencies.dependency
+        $bomNodes = @($pom.SelectNodes("/*[local-name()='project']/*[local-name()='dependencyManagement']/*[local-name()='dependencies']/*[local-name()='dependency']"))
+        if ($bomNodes.Count -ne 1) { throw '远端 Android POM 必须具有唯一 Kotlin BOM 导入项。' }
+        $bom = $bomNodes[0]
         if ($bom.groupId -ne 'org.jetbrains.kotlin' -or $bom.artifactId -ne 'kotlin-bom' -or $bom.version -ne '1.8.0' -or $bom.scope -ne 'import' -or $bom.type -ne 'pom') { throw '远端 POM 未传递 Kotlin 1.8.0 BOM。' }
-    }
-    $metadata = Get-Content -LiteralPath $files.module -Raw | ConvertFrom-Json -AsHashtable
-    if ($metadata.component.group -cne $group -or $metadata.component.module -cne $Module -or $metadata.component.version -cne $Version) { throw "远端 module 坐标不同：$Module" }
-    foreach ($usage in @('java-api','java-runtime')) {
-        $variants = @($metadata.variants | Where-Object { $_.attributes['org.gradle.usage'] -eq $usage -and $_.attributes['org.gradle.category'] -eq 'library' })
-        if ($variants.Count -ne 1) { throw "缺少唯一 $usage 变体：$Module" }
-        if ($Module -ne 'log-android' -and $variants[0].attributes['org.gradle.jvm.version'] -ne 11) { throw 'Java module 未声明 JDK 11。' }
     }
     $sourceZip = [IO.Compression.ZipFile]::OpenRead($files.sources)
     try {
         Assert-License $sourceZip $Module
         if (@($sourceZip.Entries | Where-Object { $_.FullName.EndsWith('.java') }).Count -eq 0) { throw "源码 JAR 为空：$Module" }
+        Assert-SourceContents $sourceZip $Module $files.sources
     } finally { $sourceZip.Dispose() }
     $zip = [IO.Compression.ZipFile]::OpenRead($files.binary)
     try {
@@ -278,14 +367,16 @@ function Assert-RemotePublication([string]$Module) {
             } finally { $memory.Dispose(); $stream.Dispose() }
         } else { Assert-License $zip $Module; $classCount = Assert-JavaClasses $zip $Module }
     } finally { $zip.Dispose() }
-    $checks.Add([pscustomobject]@{ Check='RemotePublication'; Module=$Module; Classes=$classCount; BinarySha256=(Get-RequiredHash $files.binary); SourcesSha256=(Get-RequiredHash $files.sources) })
+    $checks.Add([pscustomobject]@{ Check='RemotePublication'; Module=$Module; MetadataPolicy='MavenPom'; Packaging=$packaging; Classes=$classCount; PomSha256=(Get-RequiredHash $files.pom); BinarySha256=(Get-RequiredHash $files.binary); SourcesArchiveSha256=(Get-RequiredHash $files.sources) })
 }
 
 function New-Consumer([string]$Mode, [string]$Module) {
     # 每个消费者拥有空缓存和独立源码，不引用本仓库项目、mavenLocal 或任何文件仓库。
     $consumer = Assert-RunPath (Join-Path $runRoot "consumers/$Mode-$Module")
     foreach ($directory in @('gradle-home','user-home','m2','tmp','android-user','project-cache')) { [IO.Directory]::CreateDirectory((Join-Path $consumer $directory)) | Out-Null }
-    $metadataSources = if ($Mode -eq 'ModuleOnly') { 'gradleMetadata()' } else { 'mavenPom(); ignoreGradleMetadataRedirection()' }
+    if ($Mode -notin @('DefaultMaven','PomOnly')) { throw '未知的 Maven POM 消费模式。' }
+    # 默认路径完全省略 metadataSources，保留 Gradle 对 POM marker 的正常处理。
+    $metadataSources = if ($Mode -eq 'DefaultMaven') { '' } else { 'metadataSources { mavenPom(); ignoreGradleMetadataRedirection() }' }
     $settings = @'
 rootProject.name = '__NAME__'
 dependencyResolutionManagement {
@@ -293,7 +384,7 @@ dependencyResolutionManagement {
     repositories {
         google(); mavenCentral()
         exclusiveContent {
-            forRepository { maven { url = uri('https://jitpack.io'); metadataSources { __METADATA__ } } }
+            forRepository { maven { url = uri('https://jitpack.io'); __METADATA__ } }
             filter { includeGroup 'com.github.Atian10.log-record' }
         }
     }
@@ -348,6 +439,7 @@ tasks.register('verifyRuntimeGraph') {
                 def projectModules = artifacts.findAll { it.moduleVersion.id.group == 'com.github.Atian10.log-record' }.collect { it.name }.toSet()
                 assert projectModules == __PROJECT_MODULES__.toSet() : projectModules
                 if ('__MODULE__' == 'log-android') {
+                    assert names.any { it in ['annotation','annotation-jvm'] } : names
                     def kotlin = artifacts.findAll { it.moduleVersion.id.group == 'org.jetbrains.kotlin' && it.name.startsWith('kotlin-stdlib') }
                     assert !kotlin.empty
                     assert kotlin.every { it.moduleVersion.id.version == '1.8.0' } : kotlin
@@ -355,6 +447,10 @@ tasks.register('verifyRuntimeGraph') {
             }
             artifacts.each { artifact ->
                 def id = artifact.moduleVersion.id
+                def expectedExternalVersions = ['com.google.code.gson:gson':'2.10.1', 'org.xerial:sqlite-jdbc':'3.42.0.0', 'androidx.room:room-runtime':'2.5.2', 'androidx.room:room-common':'2.5.2', 'androidx.annotation:annotation':'1.6.0', 'androidx.annotation:annotation-jvm':'1.6.0']
+                def externalKey = "${id.group}:${id.name}".toString()
+                if (expectedExternalVersions.containsKey(externalKey)) { assert id.version == expectedExternalVersions[externalKey] : id }
+                if (id.group == 'org.jetbrains.kotlin' && id.name.startsWith('kotlin-stdlib')) { assert id.version == '1.8.0' : id }
                 if (id.group == 'com.github.Atian10.log-record') {
                     assert id.version == '__VERSION__'
                     assert id.name in __PROJECT_MODULES__
@@ -418,6 +514,38 @@ function Invoke-ConsumerGradle([string]$Name, [string]$ConsumerRoot, [string[]]$
     Invoke-ConsumerProcess $Name (Join-Path $JavaHome 'bin/java.exe') $arguments $ConsumerRoot
 }
 
+function Assert-ConsumerBom([string]$ConsumerRoot, [string]$Mode) {
+    # BOM 是解析 POM 时读取的依赖约束文件，不添加到应用依赖，也不伪装为 JAR。
+    $cache = Assert-RunPath (Join-Path $ConsumerRoot 'gradle-home/caches/modules-2/files-2.1/org.jetbrains.kotlin/kotlin-bom/1.8.0')
+    $files = @(Get-ChildItem -LiteralPath $cache -Recurse -File -Filter 'kotlin-bom-1.8.0.pom')
+    if ($files.Count -ne 1) { throw '实际消费缓存缺少唯一 Kotlin BOM 1.8.0 POM。' }
+    $bomPath = Assert-RunPath $files[0].FullName
+    [xml]$bom = Get-Content -LiteralPath $bomPath -Raw
+    if ($bom.project.groupId -cne 'org.jetbrains.kotlin' -or $bom.project.artifactId -cne 'kotlin-bom' -or $bom.project.version -cne '1.8.0' -or $bom.project.packaging -cne 'pom') { throw '实际读取的 Kotlin BOM POM 身份不同。' }
+    $kotlinVersionNode = $bom.SelectSingleNode("/*[local-name()='project']/*[local-name()='properties']/*[local-name()='kotlin.version']")
+    if (!$kotlinVersionNode) { throw 'Kotlin BOM 缺少 kotlin.version 属性。' }
+    $kotlinVersion = $kotlinVersionNode.InnerText.Replace('${project.version}','1.8.0')
+    if ($kotlinVersion -cne '1.8.0') { throw 'Kotlin BOM 属性未对齐 1.8.0。' }
+    $constraints = @($bom.project.dependencyManagement.dependencies.dependency | Where-Object { $_.artifactId -like 'kotlin-stdlib*' })
+    if ($constraints.Count -eq 0) { throw '实际 BOM 未提供标准库约束。' }
+    foreach ($constraint in $constraints) {
+        $constraintGroup = ([string]$constraint.groupId).Replace('${project.groupId}','org.jetbrains.kotlin')
+        $constraintVersion = ([string]$constraint.version).Replace('${kotlin.version}',$kotlinVersion).Replace('${project.version}','1.8.0')
+        if ($constraintGroup -cne 'org.jetbrains.kotlin' -or $constraintVersion -cne '1.8.0') { throw '实际 BOM 标准库约束不符合 1.8.0。' }
+    }
+    foreach ($name in @('kotlin-stdlib','kotlin-stdlib-jdk7','kotlin-stdlib-jdk8')) { if ($name -cnotin @($constraints.artifactId)) { throw "实际 BOM 缺少 $name 约束。" } }
+    $logPath = Assert-RunPath (Join-Path $runRoot "logs/$Mode-log-android-build.stdout.log")
+    $logText = Get-Content -LiteralPath $logPath -Raw
+    $bomDownloadMatches = [regex]::Matches($logText,'(?m)^Downloading (https://[^\s]+/org/jetbrains/kotlin/kotlin-bom/1\.8\.0/kotlin-bom-1\.8\.0\.pom)(?:\s|$)')
+    $sourceUris = @($bomDownloadMatches | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    if ($sourceUris.Count -ne 1) { throw '日志未证明实际 BOM POM 的唯一下载来源。' }
+    $sourceUri = [uri]$sourceUris[0]
+    if ($sourceUri.UserInfo -or $sourceUri.Host -notin @('repo.maven.apache.org','repo1.maven.org','dl.google.com','maven.google.com')) { throw 'BOM 来源不属于消费者声明的仓库。' }
+    $receipt = [pscustomobject]@{ Check='ConsumerBom'; Mode=$Mode; Group='org.jetbrains.kotlin'; Module='kotlin-bom'; Version='1.8.0'; Packaging='pom'; SourceUri=$sourceUri.AbsoluteUri; Path=$bomPath; Sha256=(Get-RequiredHash $bomPath); Log=$logPath; Constraints=@($constraints.artifactId) }
+    Write-RunJson "consumers/$Mode-log-android/bom-evidence.json" $receipt
+    $checks.Add($receipt)
+}
+
 function Assert-ConsumerOutputs([string]$ConsumerRoot, [string]$Mode, [string]$Module) {
     # 报告同时绑定编译/打包输出内容，不能只凭依赖图文件证明本轮消费完成。
     $outputPaths = [Collections.Generic.List[string]]::new()
@@ -434,14 +562,17 @@ function Assert-ConsumerOutputs([string]$ConsumerRoot, [string]$Mode, [string]$M
             (Get-RequiredHash $path) -ine (Get-RequiredHash $remoteArtifacts[$entry.module][$kind]) -or
             $entry.sha256 -ine (Get-RequiredHash $path)) { throw '消费方实际原始包与独立远端下载内容不同。' }
     }
-    # 对每个实际使用的模块核对缓存中的解析元数据，证明两种路径分别使用对应文件。
+    # 两条路径都必须实际使用同一 POM，默认路径不能被 marker 转向未知 module。
     foreach ($resolvedModule in @($projectEntries.module | Sort-Object -Unique)) {
-        $suffix = if ($Mode -eq 'ModuleOnly') { 'module' } else { 'pom' }
         $cache = Join-Path $ConsumerRoot "gradle-home/caches/modules-2/files-2.1/$group/$resolvedModule/$Version"
-        $metadataFiles = @(Get-ChildItem -LiteralPath $cache -Recurse -File -Filter "$resolvedModule-$Version.$suffix")
-        if ($metadataFiles.Count -ne 1 -or (Get-RequiredHash $metadataFiles[0].FullName) -ine (Get-RequiredHash $remoteArtifacts[$resolvedModule][$suffix])) { throw "实际解析的 $suffix 与远端原始元数据不同或缺失。" }
+        $metadataFiles = @(Get-ChildItem -LiteralPath $cache -Recurse -File -Filter "$resolvedModule-$Version.pom")
+        if ($metadataFiles.Count -ne 1 -or (Get-RequiredHash $metadataFiles[0].FullName) -ine (Get-RequiredHash $remoteArtifacts[$resolvedModule].pom)) { throw '实际解析的 POM 与远端原始元数据不同或缺失。' }
+        if ((Get-Content -LiteralPath $metadataFiles[0].FullName -Raw) -match 'published-with-gradle-metadata' -or @(Get-ChildItem -LiteralPath $cache -Recurse -File -Filter '*.module').Count -ne 0) { throw '消费者实际缓存不符合无 module/marker 的 POM 发布契约。' }
+        $outputPaths.Add($metadataFiles[0].FullName)
     }
     if ($Module -eq 'log-android') {
+        Assert-ConsumerBom $ConsumerRoot $Mode
+        $outputPaths.Add((Join-Path $ConsumerRoot 'bom-evidence.json'))
         foreach ($variant in @('debug','release')) {
             $apks = @(Get-ChildItem -LiteralPath (Join-Path $ConsumerRoot "build/outputs/apk/$variant") -Filter '*.apk' -File)
             if ($apks.Count -ne 1) { throw "未生成唯一 $variant APK。" }
@@ -470,28 +601,32 @@ function Assert-ConsumerOutputs([string]$ConsumerRoot, [string]$Mode, [string]$M
 if (Test-Path -LiteralPath $runRoot) { throw 'RunId 已存在，禁止重用旧工程、缓存或报告。' }
 $JavaHome = (Resolve-Path -LiteralPath $JavaHome).Path
 $SdkDirectory = (Resolve-Path -LiteralPath $SdkDirectory).Path
+$gitPath = (Get-Command git -CommandType Application -ErrorAction Stop).Source
 $inputPaths = @($PSCommandPath,(Join-Path $workspace 'jitpack.yml'),(Join-Path $workspace 'LICENSE'),
     (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.jar'),(Join-Path $workspace 'gradle/wrapper/gradle-wrapper.properties'),
-    (Join-Path $JavaHome 'release'),(Join-Path $JavaHome 'bin/java.exe'),(Join-Path $JavaHome 'bin/keytool.exe'),(Join-Path $SdkDirectory 'platforms/android-33/android.jar'))
+    (Join-Path $JavaHome 'release'),(Join-Path $JavaHome 'bin/java.exe'),(Join-Path $JavaHome 'bin/keytool.exe'),(Join-Path $SdkDirectory 'platforms/android-33/android.jar'),$gitPath)
 $inputs = @($inputPaths | ForEach-Object { [pscustomobject]@{ Path=$_; Sha256=(Get-RequiredHash $_) } })
 if ((Get-Content -LiteralPath (Join-Path $JavaHome 'release') -Raw) -notmatch 'JAVA_VERSION="11\.') { throw '必须使用已有 JDK 11。' }
 $wrapperProperties = Get-Content -LiteralPath (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.properties') -Raw
 if ($wrapperProperties -notmatch '(?m)^distributionUrl=https\\://services\.gradle\.org/distributions/gradle-7\.5-all\.zip\s*$' -or $wrapperProperties -notmatch '(?m)^distributionSha256Sum=[a-fA-F0-9]{64}\s*$') { throw 'Wrapper 必须固定官方 Gradle 7.5 并具备分发校验值。' }
 $licenseText = ((Get-Content -LiteralPath (Join-Path $workspace 'LICENSE') -Raw) -replace "`r`n","`n").Trim()
+if ($utf8.GetString((Read-GitBytes @('cat-file','-t',$ExpectedCommit))).Trim() -cne 'commit') { throw 'ExpectedCommit 必须对应本地已有的精确提交对象。' }
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $runRoot 'logs')) | Out-Null
-$state = [ordered]@{ State='RUNNING'; Version=$Version; ExpectedCommit=$ExpectedCommit; StartedUtc=[DateTime]::UtcNow; Inputs=$inputs; Error=$null; RemoteCancellation='客户端取消或失败不代表服务端停止，也不撤销已发布制品。' }
+$state = [ordered]@{ State='RUNNING'; MetadataPolicy='MavenPom'; ConsumerModes=@('DefaultMaven','PomOnly'); DefinitionVersion='pom-publication-v1'; Version=$Version; ExpectedCommit=$ExpectedCommit; StartedUtc=[DateTime]::UtcNow; Inputs=$inputs; Error=$null; RemoteCancellation='客户端取消或失败不代表服务端停止，也不撤销已发布制品。' }
 Write-RunJson 'run.json' $state
 $remoteLog = $null
 try {
     foreach ($module in $modules) {
         $remoteArtifacts[$module] = @{}
         $extension = if ($module -eq 'log-android') { 'aar' } else { 'jar' }
-        foreach ($kind in @('pom','module','binary','sources')) {
-            $suffix = switch ($kind) { 'pom' { '.pom' }; 'module' { '.module' }; 'binary' { ".$extension" }; 'sources' { '-sources.jar' } }
+        foreach ($kind in @('pom','binary','sources')) {
+            $suffix = switch ($kind) { 'pom' { '.pom' }; 'binary' { ".$extension" }; 'sources' { '-sources.jar' } }
             $fileName = "$module-$Version$suffix"
             $remoteArtifacts[$module][$kind] = Invoke-RemoteDownload "com/github/Atian10/log-record/$module/$Version/$fileName" "remote/$module/$fileName"
         }
+        Invoke-RemoteDownload "com/github/Atian10/log-record/$module/$Version/$module-$Version.module" "remote/$module/$module-$Version.module" -RequireAbsent
+        $checks.Add([pscustomobject]@{ Check='MetadataAbsent'; Module=$module; ExpectedStatus=404; MetadataPolicy='MavenPom' })
         Assert-RemotePublication $module
     }
     # 构建日志来自同一版本，要求精确源码身份及真实工具输出；命令回显不能替代结果。
@@ -501,7 +636,7 @@ try {
         $logText -notmatch ('(?m)^JITPACK_PROVENANCE_VERSION=' + [regex]::Escape($Version) + '\s*$') -or
         $logText -notmatch '(?m)^Gradle 7\.5\s*$' -or $logText -notmatch '(?m)^JVM:\s+11[.\s]' -or $logText -notmatch 'BUILD SUCCESSFUL') { throw '远程日志未证明预期提交、版本和 Gradle 7.5/JVM 11 成功构建。' }
     foreach ($module in $modules) { if ($logText -notmatch ([regex]::Escape(":${module}:publishToMavenLocal"))) { throw "远程日志缺少 $module 发布任务。" } }
-    foreach ($mode in @('ModuleOnly','PomOnly')) {
+    foreach ($mode in @('DefaultMaven','PomOnly')) {
         foreach ($module in $modules) {
             $consumer = New-Consumer $mode $module
             Invoke-ConsumerGradle "$mode-$module-version" $consumer @('--version')
@@ -516,7 +651,11 @@ try {
         }
     }
     foreach ($input in $inputs) { if ((Get-RequiredHash $input.Path) -cne $input.Sha256) { throw '验证期间脚本、工具或基准许可证发生变化。' } }
-    if (@($checks | Where-Object { $_.Check -eq 'Consumer' }).Count -ne 6 -or @($checks | Where-Object { $_.Check -eq 'RemotePublication' }).Count -ne 3) { throw '验证矩阵不完整。' }
+    if (@($checks | Where-Object { $_.Check -eq 'Consumer' }).Count -ne 6 -or
+        @($checks | Where-Object { $_.Check -eq 'RemotePublication' }).Count -ne 3 -or
+        @($checks | Where-Object { $_.Check -eq 'MetadataAbsent' }).Count -ne 3 -or
+        @($checks | Where-Object { $_.Check -eq 'SourceContents' }).Count -ne 3 -or
+        @($checks | Where-Object { $_.Check -eq 'ConsumerBom' }).Count -ne 2) { throw 'POM 发布与六消费者验证矩阵不完整。' }
     $state.State = 'PASSED'
 } catch {
     $firstFailure = $_

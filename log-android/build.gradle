@@ -4,6 +4,11 @@
 apply plugin: 'com.android.library'
 apply plugin: 'maven-publish'
 
+// 发布 Release AAR、完整 POM/BOM 和 sources；POM 不再重定向至 Gradle Module Metadata。
+tasks.withType(org.gradle.api.publish.tasks.GenerateModuleMetadata).configureEach {
+    enabled = false
+}
+
 // 生成目录随 buildDir 隔离；Sync 将根 MIT 文本作为声明式任务输入。
 def licenseResources = layout.buildDirectory.dir('generated/license-resources')
 def prepareLicenseResources = tasks.register('prepareLicenseResources', Sync) {
@@ -103,6 +108,11 @@ dependencies {
     // 将标准库版本对齐传递给独立消费方，避免 stdlib 1.8.0 与旧 jdk7/jdk8 重复类。
     // 沿用示例已有的 1.8.0 基线，不增加 Kotlin 编译插件或变更 AGP/JDK。
     implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.0')
+
+    // POM 消费验证中仅导入 BOM 仍解析出了 1.7.20 的兼容包；发布方显式传递既定的 1.8.0。
+    // 不让消费方额外补 BOM 或强制解析规则，也不把 BOM 当作运行时 JAR。
+    runtimeOnly 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.0'
+    runtimeOnly 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.0'
 
     // AndroidX 注解
     implementation 'androidx.annotation:annotation:1.6.0'

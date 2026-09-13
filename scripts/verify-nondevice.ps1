@@ -8,6 +8,8 @@ param(
     # 本机已有的工具目录，不安装或自动下载 JDK、SDK。
     [string]$JavaHome = 'E:\Java\temurin-11',
     [string]$SdkDirectory = 'E:\AndroidDev\Sdk',
+    # 离线模式使用已有 Wrapper 分发及只读依赖缓存；缺失即失败，不启动下载。
+    [switch]$Offline,
     # 可显式选择受影响的验证阶段；每次调用生成独立日志和源码指纹。
     [ValidateSet('Environment','Tests','Android','Lint','Publish','Consumers','PublicationArtifacts','Artifacts')]
     [string[]]$Stages = @('Environment','Tests','Android','Lint','Publish','Consumers','Artifacts'),
@@ -21,7 +23,10 @@ $ErrorActionPreference = 'Stop'
 $workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $verificationBase = Join-Path $workspace 'build/verification'
 $runRoot = Join-Path $verificationBase $RunId
-$gradleHome = Join-Path $workspace '.gradle/verification-home'
+$seedHome = Join-Path $workspace '.gradle/verification-home'
+$gradleHome = if ($Offline) { Join-Path $runRoot 'gradle-home' } else { $seedHome }
+$offlineLauncher = $null
+$consumerModes = @('DefaultMaven','PomOnly')
 $attemptId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,6)
 $attemptRoot = Join-Path $runRoot "attempts/$attemptId"
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -39,7 +44,8 @@ function Get-BuildInputState {
     })
     # 工具路径和实际 JDK/SDK 核心文件也进入身份，避免不同环境复用同一 receipt。
     $inputDescription = ConvertTo-Json -InputObject ([pscustomobject]@{
-        Files=$inputFiles; JavaHome=$JavaHome; SdkDirectory=$SdkDirectory
+        Files=$inputFiles; JavaHome=$JavaHome; SdkDirectory=$SdkDirectory; Offline=[bool]$Offline; PublicationMetadata='Pom'
+        OfflineLauncher=if ($Offline) { (Get-FileHash -LiteralPath $offlineLauncher).Hash } else { $null }
         JavaRelease=(Get-FileHash -LiteralPath (Join-Path $JavaHome 'release') -Algorithm SHA256).Hash
         AndroidJar=(Get-FileHash -LiteralPath (Join-Path $SdkDirectory 'platforms/android-33/android.jar') -Algorithm SHA256).Hash
     }) -Depth 6 -Compress
@@ -169,7 +175,7 @@ function Save-PreviousTestReports {
     }
 }
 
-function Invoke-VerificationProcess([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory) {
+function Invoke-VerificationProcess([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory, [string]$ProcessGradleHome = $gradleHome) {
     # 使用参数数组直接启动进程，不经 shell 拼接；只终止本次进程树。
     $stdoutPath = Join-Path $attemptRoot "$Name.stdout.log"
     $stderrPath = Join-Path $attemptRoot "$Name.stderr.log"
@@ -181,11 +187,17 @@ function Invoke-VerificationProcess([string]$Name, [string]$Executable, [string[
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
+    foreach ($environmentName in @('JAVA_TOOL_OPTIONS','_JAVA_OPTIONS','JDK_JAVA_OPTIONS','JAVA_OPTS','GRADLE_OPTS','GRADLE_RO_DEP_CACHE')) {
+        [void]$startInfo.Environment.Remove($environmentName)
+    }
     $startInfo.Environment['JAVA_HOME'] = $JavaHome
     $startInfo.Environment['ANDROID_HOME'] = $SdkDirectory
     $startInfo.Environment['ANDROID_SDK_ROOT'] = $SdkDirectory
     $startInfo.Environment['ANDROID_USER_HOME'] = Join-Path $runRoot 'android-user'
-    $startInfo.Environment['GRADLE_USER_HOME'] = $gradleHome
+    $startInfo.Environment['GRADLE_USER_HOME'] = $ProcessGradleHome
+    if ($Offline) { $startInfo.Environment['GRADLE_RO_DEP_CACHE'] = Join-Path $seedHome 'caches' }
+    $startInfo.Environment['HOME'] = Join-Path $runRoot 'user-home'
+    $startInfo.Environment['USERPROFILE'] = Join-Path $runRoot 'user-home'
     $startInfo.Environment['TEMP'] = Join-Path $runRoot 'tmp/gradle'
     $startInfo.Environment['TMP'] = Join-Path $runRoot 'tmp/gradle'
     $process = [Diagnostics.Process]::new()
@@ -266,6 +278,7 @@ function Invoke-VerificationProcess([string]$Name, [string]$Executable, [string[
         $results.Add([pscustomobject]@{
             Name=$Name; StartedUtc=$startedAt; Started=$started; ExitCode=$exitCode; TimedOut=$timedOut
             ElapsedMilliseconds=$elapsed.ElapsedMilliseconds; Arguments=$Arguments; Stdout=$stdoutPath; Stderr=$stderrPath
+            Offline=[bool]$Offline; GradleHome=$ProcessGradleHome; ReadOnlyDependencyCache=if ($Offline) { Join-Path $seedHome 'caches' } else { $null }
             Error=if ($null -ne $failure) { $failure.ToString() } else { $null }; CleanupErrors=@($cleanupFailures.ToArray())
         })
         try { Write-VerificationText (Join-Path $attemptRoot 'commands.json') (ConvertTo-Json -InputObject @($results.ToArray()) -Depth 6) }
@@ -286,33 +299,43 @@ function Invoke-VerificationProcess([string]$Name, [string]$Executable, [string[
 }
 
 function Invoke-GradleVerification([string]$Name, [string[]]$Tasks, [string]$ProjectDirectory = $workspace) {
-    # 直接调用仓库 Wrapper 主类，版本仍由原 gradle-wrapper.properties 决定。
+    # --offline 不限制 Wrapper 下载；离线时只启动已验证的 Wrapper 缓存分发。
     $projectName = Split-Path -Leaf $ProjectDirectory
-    $arguments = @('-Dfile.encoding=UTF-8', ('-Djava.io.tmpdir=' + (Join-Path $runRoot 'tmp/gradle')),
-        '-classpath', (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.jar'), 'org.gradle.wrapper.GradleWrapperMain',
+    $processHome = if ($Offline -and $ProjectDirectory -ne $workspace) { Join-Path $runRoot "consumer-caches/$projectName" } else { $gradleHome }
+    [IO.Directory]::CreateDirectory((Assert-WorkspacePath $processHome)) | Out-Null
+    $launcher = if ($Offline) { $offlineLauncher } else { Join-Path $workspace 'gradle/wrapper/gradle-wrapper.jar' }
+    $mainClass = if ($Offline) { 'org.gradle.launcher.GradleMain' } else { 'org.gradle.wrapper.GradleWrapperMain' }
+    $arguments = @('-Dfile.encoding=UTF-8', ('-Djava.io.tmpdir=' + (Join-Path $runRoot 'tmp/gradle')), ('-Duser.home=' + (Join-Path $runRoot 'user-home')),
+        '-classpath', $launcher, $mainClass,
         '--no-daemon','--no-parallel','--no-build-cache','--no-configuration-cache','--console=plain','--stacktrace',
-        '-g', $gradleHome, '-p', $ProjectDirectory, '--project-cache-dir', (Join-Path $runRoot "project-cache/$projectName"),
+        '-g', $processHome, '-p', $ProjectDirectory, '--project-cache-dir', (Join-Path $runRoot "project-cache/$projectName"),
         '-I', (Join-Path $workspace 'gradle/verification.init.gradle'),
+        '-I', (Join-Path $runRoot 'scope.init.gradle'),
         ('-Dorg.gradle.java.home=' + $JavaHome), ('-Dmaven.repo.local=' + (Join-Path $runRoot 'm2')),
         ('-PverificationWorkspace=' + $workspace), ('-PverificationRoot=' + $runRoot),
         ('-PverificationJavaHome=' + $JavaHome), ('-ProomSchemaDir=' + (Join-Path $runRoot 'schemas')),
-        '-PlibraryVersion=0.0.0-local-validation','-Pandroid.builder.sdkDownload=false','-Porg.gradle.java.installations.auto-download=false') + $Tasks
-    Invoke-VerificationProcess $Name (Join-Path $JavaHome 'bin/java.exe') $arguments $ProjectDirectory
+        '-PlibraryVersion=0.0.0-local-validation','-Pandroid.builder.sdkDownload=false','-Porg.gradle.java.installations.auto-download=false')
+    if ($Offline) { $arguments += '--offline' }
+    $arguments += $Tasks
+    Invoke-VerificationProcess $Name (Join-Path $JavaHome 'bin/java.exe') $arguments $ProjectDirectory $processHome
 }
 
-function New-ConsumerProjects {
-    # 三个独立消费入口只编译和核对解析图；不调用库初始化或执行数据库操作。
+function New-ConsumerProjects([string]$Mode) {
+    # 每个模式三个独立项目；DefaultMaven 不配置 metadataSources，不能与 PomOnly 同义。
     $repositoryUri = ([uri](Join-Path $runRoot 'm2')).AbsoluteUri
-    $javaConsumer = Join-Path $runRoot 'consumers/consumer-java'
-    $androidConsumer = Join-Path $runRoot 'consumers/consumer-android'
+    $prefix = if ($Mode -eq 'DefaultMaven') { 'consumer' } else { 'consumer-pom' }
+    $metadataBlock = if ($Mode -eq 'PomOnly') { 'metadataSources { mavenPom(); ignoreGradleMetadataRedirection() }' } else { '' }
+    $repositories = "repositories { google(); mavenCentral(); exclusiveContent { forRepository { maven { url '$repositoryUri'; $metadataBlock } }; filter { includeGroup 'com.github.Atian10.log-record' } } }"
+    $javaConsumer = Join-Path $runRoot "consumers/$prefix-java"
+    $androidConsumer = Join-Path $runRoot "consumers/$prefix-android"
     # 直接 core 消费方可以发现仅由平台适配层掩盖的公开依赖缺失。
-    $coreConsumer = Join-Path $runRoot 'consumers/consumer-core'
-    Write-VerificationText (Join-Path $coreConsumer 'settings.gradle') "rootProject.name = 'consumer-core'"
+    $coreConsumer = Join-Path $runRoot "consumers/$prefix-core"
+    Write-VerificationText (Join-Path $coreConsumer 'settings.gradle') "rootProject.name = '$prefix-core'"
     Write-VerificationText (Join-Path $coreConsumer 'build.gradle') @"
 plugins { id 'java' }
 java { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
 tasks.withType(JavaCompile).configureEach { options.release = 11 }
-repositories { maven { url '$repositoryUri' }; mavenCentral() }
+$repositories
 dependencies { implementation 'com.github.Atian10.log-record:log-core:0.0.0-local-validation' }
 // 断言原始发布制品来自本轮 m2，不运行 Consumer 中的方法。
 tasks.register('verifyRuntimeGraph') {
@@ -339,12 +362,12 @@ public final class Consumer {
     public static LogConfig.Builder configuration(Gson gson) { return new LogConfig.Builder(); }
 }
 '@
-    Write-VerificationText (Join-Path $javaConsumer 'settings.gradle') "rootProject.name = 'consumer-java'"
+    Write-VerificationText (Join-Path $javaConsumer 'settings.gradle') "rootProject.name = '$prefix-java'"
     Write-VerificationText (Join-Path $javaConsumer 'build.gradle') @"
 plugins { id 'java' }
 java { sourceCompatibility = JavaVersion.VERSION_11; targetCompatibility = JavaVersion.VERSION_11 }
 tasks.withType(JavaCompile).configureEach { options.release = 11 }
-repositories { maven { url '$repositoryUri' }; mavenCentral() }
+$repositories
 dependencies { implementation 'com.github.Atian10.log-record:log-desktop:0.0.0-local-validation' }
 tasks.register('verifyRuntimeGraph') {
     doLast {
@@ -370,7 +393,7 @@ public final class Consumer {
     public static void initialize(String path) { DesktopLogInit.init(path, new LogConfig.Builder()); }
 }
 '@
-    Write-VerificationText (Join-Path $androidConsumer 'settings.gradle') "rootProject.name = 'consumer-android'"
+    Write-VerificationText (Join-Path $androidConsumer 'settings.gradle') "rootProject.name = '$prefix-android'"
     Write-VerificationText (Join-Path $androidConsumer 'build.gradle') @"
 buildscript {
     repositories { google(); mavenCentral() }
@@ -390,7 +413,7 @@ android {
         }
     }
 }
-repositories { maven { url '$repositoryUri' }; google(); mavenCentral() }
+$repositories
 dependencies { implementation 'com.github.Atian10.log-record:log-android:0.0.0-local-validation' }
 tasks.register('verifyRuntimeGraph') {
     doLast {
@@ -425,6 +448,93 @@ public final class Consumer {
     public static void initialize(Context context) { AndroidLogInit.init(context, new LogConfig.Builder()); }
 }
 '@
+    # 本地 Maven 文件来源与原始下载来源分开记账；本轮不访问远端仓库。
+    foreach ($entry in @(@($coreConsumer,'log-core'),@($javaConsumer,'log-desktop'),@($androidConsumer,'log-android'))) {
+        $consumerPath = $entry[0]; $module = $entry[1]
+        $graphChecks = @'
+
+configurations {
+    verificationSources { transitive = false; canBeConsumed = false }
+    verificationPoms { transitive = false; canBeConsumed = false }
+    verificationBom { transitive = false; canBeConsumed = false }
+}
+def libraryModules = '__MODULE__' == 'log-core' ? ['log-core'] : ['__MODULE__', 'log-core']
+dependencies {
+    libraryModules.each { name ->
+        verificationSources "com.github.Atian10.log-record:${name}:0.0.0-local-validation:sources@jar"
+        verificationPoms "com.github.Atian10.log-record:${name}:0.0.0-local-validation@pom"
+    }
+    if ('__MODULE__' == 'log-android') verificationBom 'org.jetbrains.kotlin:kotlin-bom:1.8.0@pom'
+}
+tasks.named('verifyRuntimeGraph') {
+    doLast {
+        assert gradle.gradleVersion == '7.5' && JavaVersion.current() == JavaVersion.VERSION_11
+        def names = '__MODULE__' == 'log-android' ? ['debugRuntimeClasspath','releaseRuntimeClasspath'] : ['runtimeClasspath']
+        names += ['verificationSources','verificationPoms']
+        if ('__MODULE__' == 'log-android') names += 'verificationBom'
+        def reports = []
+        names.each { configurationName ->
+            def configuration = configurations.getByName(configurationName)
+            assert configuration.incoming.resolutionResult.allComponents.every {
+                !(it.id instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier) || it.id == configuration.incoming.resolutionResult.root.id
+            } : 'Project dependency substitution is forbidden'
+            def artifacts = configuration.resolvedConfiguration.resolvedArtifacts
+            assert !artifacts.empty : configurationName
+            if (configurationName.endsWith('RuntimeClasspath') || configurationName == 'runtimeClasspath') {
+                def expected = ['com.google.code.gson:gson':'2.10.1']
+                if ('__MODULE__' == 'log-desktop') expected['org.xerial:sqlite-jdbc'] = '3.42.0.0'
+                if ('__MODULE__' == 'log-android') expected['androidx.room:room-runtime'] = '2.5.2'
+                expected.each { id, version ->
+                    def matches = artifacts.findAll { "${it.moduleVersion.id.group}:${it.name}" == id }
+                    assert matches.size() == 1 && matches[0].moduleVersion.id.version == version : "${id}: ${matches}"
+                }
+                if ('__MODULE__' == 'log-android') {
+                    def annotations = artifacts.findAll { it.moduleVersion.id.group == 'androidx.annotation' && (it.name in ['annotation','annotation-jvm']) }
+                    assert !annotations.empty && annotations.every { it.moduleVersion.id.version == '1.6.0' }
+                    def kotlin = artifacts.findAll { it.moduleVersion.id.group == 'org.jetbrains.kotlin' && it.name.startsWith('kotlin-stdlib') }
+                    assert !kotlin.empty && kotlin.every { it.moduleVersion.id.version == '1.8.0' }
+                }
+            }
+            artifacts.each { artifact ->
+                def id = artifact.moduleVersion.id
+                if (id.group == 'com.github.Atian10.log-record') {
+                    assert id.name in libraryModules && id.version == '0.0.0-local-validation'
+                    assert artifact.file.canonicalFile.toPath().startsWith(new File(new URI('__REPOSITORY__')).canonicalFile.toPath())
+                }
+                if (configurationName == 'verificationBom') {
+                    assert id.group == 'org.jetbrains.kotlin' && id.name == 'kotlin-bom' && id.version == '1.8.0' && artifact.extension == 'pom'
+                }
+                reports << [configuration:configurationName, group:id.group, module:id.name, version:id.version,
+                    classifier:artifact.classifier, extension:artifact.extension, path:artifact.file.canonicalPath,
+                    sha256:java.security.MessageDigest.getInstance('SHA-256').digest(artifact.file.bytes).encodeHex().toString()]
+            }
+        }
+        file('resolved-artifacts.json').text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(
+            [mode:'__MODE__', module:'__MODULE__', publicationMetadata:'Pom', offline:gradle.startParameter.offline,
+             libraryRepository:'__REPOSITORY__', gradleHome:gradle.gradleUserHomeDir.canonicalPath, artifacts:reports]))
+    }
+}
+'@
+        $buildFile = Join-Path $consumerPath 'build.gradle'
+        $graphChecks = $graphChecks.Replace('__MODULE__',$module).Replace('__MODE__',$Mode).Replace('__REPOSITORY__',$repositoryUri)
+        Write-VerificationText $buildFile ((Get-Content -LiteralPath $buildFile -Raw) + $graphChecks)
+    }
+}
+
+function Assert-OfflineDistribution {
+    # 必须在启动 Java/Gradle 之前完成，避免 --offline 到达 Gradle 之前 Wrapper 已联网。
+    $wrapper = Get-Content -LiteralPath (Join-Path $workspace 'gradle/wrapper/gradle-wrapper.properties') -Raw
+    if ($wrapper -notmatch '(?m)^distributionUrl=https\\://services\.gradle\.org/distributions/gradle-7\.5-all\.zip\s*$' -or
+        $wrapper -notmatch '(?m)^distributionSha256Sum=97a52d145762adc241bad7fd18289bf7f6801e08ece6badf80402fe2b9f250b1\s*$') { throw '离线验证要求原官方 Gradle 7.5 Wrapper 和固定校验值。' }
+    $distributionRoot = Join-Path $seedHome 'wrapper/dists/gradle-7.5-all'
+    if (!(Test-Path -LiteralPath $distributionRoot)) { throw '缺少已有 Gradle 7.5 分发；离线模式不会下载。' }
+    $launchers = @(Get-ChildItem -LiteralPath $distributionRoot -Directory | ForEach-Object {
+        $launcher = Join-Path $_.FullName 'gradle-7.5/lib/gradle-launcher-7.5.jar'
+        if ((Test-Path -LiteralPath (Join-Path $_.FullName 'gradle-7.5-all.zip.ok')) -and (Test-Path -LiteralPath $launcher)) { $launcher }
+    })
+    if ($launchers.Count -ne 1) { throw '未发现唯一且已完成 Wrapper 校验的 Gradle 7.5 分发；不会自动下载。' }
+    if (!(Test-Path -LiteralPath (Join-Path $seedHome 'caches/modules-2'))) { throw '缺少已有离线依赖缓存。' }
+    $script:offlineLauncher = Assert-WorkspacePath $launchers[0]
 }
 
 function Assert-LocalSdkDirectory {
@@ -463,13 +573,29 @@ function Initialize-VerificationDebugKey {
 $JavaHome = [IO.Path]::GetFullPath($JavaHome)
 $SdkDirectory = [IO.Path]::GetFullPath($SdkDirectory)
 Assert-LocalSdkDirectory
-foreach ($path in @($runRoot, $attemptRoot, $gradleHome, (Join-Path $runRoot 'tmp/gradle'), (Join-Path $runRoot 'keys'), (Join-Path $runRoot 'android-user'))) {
+if ($Offline) { Assert-OfflineDistribution }
+foreach ($path in @($runRoot, $attemptRoot, $gradleHome, (Join-Path $runRoot 'tmp/gradle'), (Join-Path $runRoot 'keys'), (Join-Path $runRoot 'android-user'), (Join-Path $runRoot 'user-home'))) {
     [IO.Directory]::CreateDirectory((Assert-WorkspacePath $path)) | Out-Null
 }
 foreach ($requiredFile in @((Join-Path $JavaHome 'bin/java.exe'), (Join-Path $JavaHome 'bin/keytool.exe'), (Join-Path $SdkDirectory 'platforms/android-33/android.jar'), (Join-Path $SdkDirectory 'build-tools/30.0.3/aapt2.exe'))) {
     if (!(Test-Path -LiteralPath $requiredFile -PathType Leaf)) { throw "缺少已约定工具组件：$requiredFile" }
 }
 if ((Get-Content -LiteralPath (Join-Path $JavaHome 'release') -Raw) -notmatch 'JAVA_VERSION="11\.') { throw '验证必须使用已安装的 JDK 11。' }
+$scopeGuard = @'
+// 按当次选择阶段限制任务图；不修改工程公共 init 脚本。
+gradle.taskGraph.whenReady { graph ->
+    if (__OFFLINE__ && !gradle.startParameter.offline) throw new GradleException('离线模式必须传递 --offline')
+    graph.allTasks.each { task ->
+        if (task instanceof org.gradle.api.tasks.JavaExec ||
+            (!__TESTS__ && (task instanceof org.gradle.api.tasks.testing.Test || task.name ==~ /(?i).*test.*/)) ||
+            (!__LINT__ && task.name ==~ /(?i)lint(?!Vital).*/) ||
+            task.name ==~ /(?i)(connected.*|managedDevice.*|install.*|uninstall.*|run.*|.*To.*Repository)/) {
+            throw new GradleException("当前阶段不允许执行任务：${task.path}")
+        }
+    }
+}
+'@
+Write-VerificationText (Join-Path $runRoot 'scope.init.gradle') ($scopeGuard.Replace('__OFFLINE__',([bool]$Offline).ToString().ToLowerInvariant()).Replace('__TESTS__',($Stages -contains 'Tests').ToString().ToLowerInvariant()).Replace('__LINT__',($Stages -contains 'Lint').ToString().ToLowerInvariant()))
 # 阶段记录共用本次稳定的构建输入指纹；后续每阶段再次核验，避免运行中途换源码。
 $buildInputState = Get-BuildInputState
 # 本轮源码指纹包括未跟踪的新脚本；不把旧 HEAD 单独当成实际验证源码身份。
@@ -477,9 +603,10 @@ $sourcePaths = @(& git -C $workspace -c core.quotepath=false ls-files) + @('jitp
 $sourceHashes = @($sourcePaths | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath (Join-Path $workspace $_) -PathType Leaf } | ForEach-Object {
     [pscustomobject]@{ Path=$_; Hash=(Get-FileHash -LiteralPath (Join-Path $workspace $_) -Algorithm SHA256).Hash }
 })
-Write-VerificationText (Join-Path $attemptRoot 'source-state.json') (ConvertTo-Json -InputObject ([pscustomobject]@{ Head=(& git -C $workspace rev-parse HEAD); Files=$sourceHashes; BuildFingerprint=$buildInputState.Fingerprint; BuildInputs=$buildInputState.Files; JavaHome=$JavaHome; Sdk=$SdkDirectory; Stages=$Stages }) -Depth 6)
+Write-VerificationText (Join-Path $attemptRoot 'source-state.json') (ConvertTo-Json -InputObject ([pscustomobject]@{ Head=(& git -C $workspace rev-parse HEAD); Files=$sourceHashes; BuildFingerprint=$buildInputState.Fingerprint; BuildInputs=$buildInputState.Files; JavaHome=$JavaHome; Sdk=$SdkDirectory; Stages=$Stages; Offline=[bool]$Offline; PublicationMetadata='Pom'; ConsumerModes=$consumerModes; OfflineLauncher=$offlineLauncher; ReadOnlyDependencyCache=if ($Offline) { Join-Path $seedHome 'caches' } else { $null } }) -Depth 6)
 Write-Output "RUN_ROOT $runRoot"
 
+try {
 if ('Environment' -in $Stages) {
     # Environment 仅证明本轮实际工具与任务清单，输出固定在当前尝试目录。
     $environmentReceipt = Start-VerificationStage 'Environment'
@@ -539,13 +666,17 @@ if ('Consumers' -in $Stages) {
     # 当前发布未成功或内容变化时，不允许生成新的消费成功记录。
     $consumersReceipt = Start-VerificationStage 'Consumers' @('Publish')
     Initialize-VerificationDebugKey
-    New-ConsumerProjects
-    Invoke-GradleVerification 'consume-core' @('classes','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-core')
-    Invoke-GradleVerification 'consume-java' @('classes','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-java')
-    Invoke-GradleVerification 'consume-android' @('assembleDebug','assembleRelease','verifyRuntimeGraph') (Join-Path $runRoot 'consumers/consumer-android')
-    Complete-VerificationStage $consumersReceipt @((Join-Path $runRoot 'consumers'),
-        (Join-Path $runRoot 'modules/consumer-core/classes/java/main'), (Join-Path $runRoot 'modules/consumer-java/classes/java/main'),
-        (Join-Path $runRoot 'modules/consumer-android/outputs/apk'), (Join-Path $runRoot 'modules/consumer-android/outputs/mapping/release'))
+    $consumerOutputs = @((Join-Path $runRoot 'consumers'))
+    foreach ($mode in $consumerModes) {
+        New-ConsumerProjects $mode
+        $prefix = if ($mode -eq 'DefaultMaven') { 'consumer' } else { 'consumer-pom' }
+        Invoke-GradleVerification "$mode-consume-core" @('classes','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-core")
+        Invoke-GradleVerification "$mode-consume-java" @('classes','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-java")
+        Invoke-GradleVerification "$mode-consume-android" @('assembleDebug','assembleRelease','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-android")
+        $consumerOutputs += @((Join-Path $runRoot "modules/$prefix-core/classes/java/main"), (Join-Path $runRoot "modules/$prefix-java/classes/java/main"),
+            (Join-Path $runRoot "modules/$prefix-android/outputs/apk"), (Join-Path $runRoot "modules/$prefix-android/outputs/mapping/release"))
+    }
+    Complete-VerificationStage $consumersReceipt $consumerOutputs
 }
 if ('PublicationArtifacts' -in $Stages) {
     # 独立发布验收只承接本轮 Publish/Consumers，不降低下方完整 Artifacts 的前置要求。
@@ -559,9 +690,12 @@ if ('PublicationArtifacts' -in $Stages) {
         (ConvertTo-Json -InputObject $schemaGenerated -Depth 100 -Compress)) { throw '发布生成的 Room schema 与源码不一致。' }
     Write-VerificationText (Join-Path $attemptRoot 'publication-checks.json') (ConvertTo-Json -InputObject $publicationChecks -Depth 8)
     # 单独记录本轮分发文件及消费者结果的身份，历史完整验收报告保持原样。
-    $publicationHashes = @(Get-OutputHashes @((Join-Path $runRoot 'm2/com/github/Atian10/log-record'),
-        (Join-Path $runRoot 'modules/consumer-core/classes/java/main'), (Join-Path $runRoot 'modules/consumer-java/classes/java/main'),
-        (Join-Path $runRoot 'modules/consumer-android/outputs')))
+    $publicationPaths = @((Join-Path $runRoot 'm2/com/github/Atian10/log-record'))
+    foreach ($prefix in @('consumer','consumer-pom')) {
+        $publicationPaths += @((Join-Path $runRoot "modules/$prefix-core/classes/java/main"), (Join-Path $runRoot "modules/$prefix-java/classes/java/main"),
+            (Join-Path $runRoot "modules/$prefix-android/outputs"))
+    }
+    $publicationHashes = @(Get-OutputHashes $publicationPaths)
     Write-VerificationText (Join-Path $attemptRoot 'publication-artifacts.json') (ConvertTo-Json -InputObject $publicationHashes -Depth 6)
     Complete-VerificationStage $publicationReceipt @((Join-Path $attemptRoot 'publication-checks.json'),
         (Join-Path $attemptRoot 'publication-artifacts.json'), (Join-Path $runRoot 'schemas'))
@@ -587,3 +721,25 @@ if ('Artifacts' -in $Stages) {
     Write-Output 'PASS schema-and-artifact-hashes'
 }
 Write-Output "COMPLETED $attemptRoot"
+} catch {
+    $firstFailure = $_
+    # 仅关闭本次尝试的 RUNNING 状态；不改写其他尝试或历史失败证据。
+    try {
+    foreach ($stage in $Stages) {
+        $receiptPath = Join-Path $runRoot "receipts/$stage.json"
+        if (!(Test-Path -LiteralPath $receiptPath)) { continue }
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -AsHashtable
+        if ($receipt.State -ne 'RUNNING' -or $receipt.Attempt -cne $attemptId) { continue }
+        $receipt.State = 'FAILED'
+        $receipt['FailedUtc'] = [DateTime]::UtcNow.ToString('o')
+        $receipt['Error'] = $firstFailure.Exception.ToString()
+        $receiptText = ConvertTo-Json -InputObject $receipt -Depth 8
+        Write-VerificationText $receiptPath $receiptText
+        Write-VerificationText (Join-Path $attemptRoot "$stage.receipt.json") $receiptText
+    }
+    } catch {
+        # 记录介质失效不能覆盖已经取得的构建或验收首错。
+        [Console]::Error.WriteLine("保存阶段失败记录时另有错误：$($_.Exception)")
+    }
+    throw $firstFailure
+}

@@ -4,6 +4,11 @@
 apply plugin: 'java-library'
 apply plugin: 'maven-publish'
 
+// 保留完整 POM 和 sources classifier，不分发 JitPack 上出现身份错误的 GMM。
+tasks.withType(org.gradle.api.publish.tasks.GenerateModuleMetadata).configureEach {
+    enabled = false
+}
+
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11

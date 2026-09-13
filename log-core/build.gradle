@@ -4,6 +4,11 @@
 apply plugin: 'java-library'
 apply plugin: 'maven-publish'
 
+// JitPack 使用 Maven POM 发布契约；同时让 Gradle 停止写入 POM 的 metadata 重定向标记。
+tasks.withType(org.gradle.api.publish.tasks.GenerateModuleMetadata).configureEach {
+    enabled = false
+}
+
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
@@ -31,7 +36,7 @@ tasks.withType(Jar).configureEach {
     }
 }
 
-// 从 Java 组件发布，保留 Gson 等传递依赖及 Java 11 兼容属性。
+// 从 Java 组件发布并保留 Gson 传递依赖；Java 11 兼容性由编译及字节码检查保证。
 publishing {
     publications {
         mavenJava(MavenPublication) {

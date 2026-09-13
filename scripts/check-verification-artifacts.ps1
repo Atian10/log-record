@@ -12,6 +12,32 @@ $version = '0.0.0-local-validation'
 $group = 'com.github.Atian10.log-record'
 $checks = [Collections.Generic.List[object]]::new()
 
+function Assert-SourceEntries($Zip, [string]$Module) {
+    # 本地包对应当前构建输入的原始字节；远端验收另以完整 Git 提交的 blob 比对。
+    $sourceRoot = [IO.Path]::GetFullPath((Join-Path $Workspace "$Module/src/main/java"))
+    $expected = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Filter '*.java') {
+        $relative = [IO.Path]::GetRelativePath($sourceRoot,$file.FullName).Replace('\','/')
+        $expected.Add($relative,$file.FullName)
+    }
+    $duplicates = @($Zip.Entries | Group-Object FullName | Where-Object Count -gt 1)
+    if ($duplicates.Count) { throw "源码包包含重复条目：$Module" }
+    $entries = @($Zip.Entries | Where-Object { $_.FullName.EndsWith('.java',[StringComparison]::Ordinal) })
+    if (!$expected.Count -or $entries.Count -ne $expected.Count) { throw "源码包条目数量与当前输入不同：$Module" }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($entry in $entries) {
+            if (!$expected.ContainsKey($entry.FullName)) { throw "源码包包含额外或路径不一致的 Java 条目：$($entry.FullName)" }
+            $stream = $entry.Open()
+            try { $actualHash = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-','') }
+            finally { $stream.Dispose() }
+            $expectedHash = (Get-FileHash -LiteralPath $expected[$entry.FullName]).Hash
+            if ($actualHash -cne $expectedHash) { throw "源码条目与本轮输入字节不一致：$Module/$($entry.FullName)" }
+            $checks.Add([pscustomobject]@{ Check='SourceEntry'; Module=$Module; Entry=$entry.FullName; SourcePath=$expected[$entry.FullName]; SHA256=$actualHash; Basis='CurrentBuildInputBytes' })
+        }
+    } finally { $hasher.Dispose() }
+}
+
 function Require-File([string]$RelativePath) {
     $path = Join-Path $RunRoot $RelativePath
     if (!(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
@@ -70,11 +96,17 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
     $artifact = Require-File "$repositoryPath.$extension"
     $sources = Require-File "$repositoryPath-sources.jar"
     $pomPath = Require-File "$repositoryPath.pom"
-    $metadataPath = Require-File "$repositoryPath.module"
-    [xml]$pom = Get-Content -LiteralPath $pomPath -Raw
+    $versionDirectory = Split-Path -Parent $pomPath
+    if (@(Get-ChildItem -LiteralPath $versionDirectory -Filter '*.module' -File).Count) { throw "POM 发布策略不允许分发 .module：$module" }
+    $pomText = Get-Content -LiteralPath $pomPath -Raw
+    if ($pomText -match 'published-with-gradle-metadata|do_not_remove:.*gradle') { throw "POM 仍包含 Gradle Metadata 重定向标记：$module" }
+    [xml]$pom = $pomText
     if ($pom.project.groupId -ne $group -or $pom.project.artifactId -ne $module -or $pom.project.version -ne $version) {
         throw "POM 坐标不一致：$module"
     }
+    $packagingNode = $pom.SelectSingleNode('/*[local-name()="project"]/*[local-name()="packaging"]')
+    $packaging = if ($packagingNode) { $packagingNode.InnerText } else { 'jar' }
+    if ($packaging -cne $extension) { throw "POM 包类型错误：$module/$packaging" }
     # 除依赖坐标之外，独立分发的 POM 还应能识别项目、源码及自身许可。
     if ([string]::IsNullOrWhiteSpace($pom.project.name) -or
         [string]::IsNullOrWhiteSpace($pom.project.description) -or
@@ -89,27 +121,22 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
     $expected = switch ($module) {
         'log-core' { @('com.google.code.gson:gson:2.10.1:compile') }
         'log-desktop' { @("${group}:log-core:${version}:compile", 'org.xerial:sqlite-jdbc:3.42.0.0:runtime') }
-        'log-android' { @("${group}:log-core:${version}:compile", 'androidx.room:room-runtime:2.5.2:runtime', 'androidx.annotation:annotation:1.6.0:runtime') }
+        'log-android' { @("${group}:log-core:${version}:compile", 'androidx.room:room-runtime:2.5.2:runtime', 'androidx.annotation:annotation:1.6.0:runtime',
+            'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.0:runtime', 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.0:runtime') }
     }
     $actual = @($pom.project.dependencies.dependency | ForEach-Object { "$($_.groupId):$($_.artifactId):$($_.version):$($_.scope)" })
     if (@(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)).Count -gt 0) {
         throw "POM 依赖不符合约定：$module，$actual"
     }
     if ($module -eq 'log-android') {
-        $bom = $pom.project.dependencyManagement.dependencies.dependency
+        $bomNodes = @($pom.SelectNodes('/*[local-name()="project"]/*[local-name()="dependencyManagement"]/*[local-name()="dependencies"]/*[local-name()="dependency"]'))
+        if ($bomNodes.Count -ne 1) { throw 'Android POM 必须具有唯一 Kotlin BOM 导入项。' }
+        $bom = $bomNodes[0]
         if ($bom.groupId -ne 'org.jetbrains.kotlin' -or $bom.artifactId -ne 'kotlin-bom' -or
             $bom.version -ne '1.8.0' -or $bom.type -ne 'pom' -or $bom.scope -ne 'import') {
             throw 'Android POM 未传递 Kotlin 1.8.0 BOM。'
         }
     }
-    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json -AsHashtable
-    if ($metadata.component.group -ne $group -or $metadata.component.module -ne $module -or $metadata.component.version -ne $version) {
-        throw "Gradle metadata 坐标不一致：$module"
-    }
-    $runtimeVariants = @($metadata.variants | Where-Object { $_.attributes['org.gradle.usage'] -eq 'java-runtime' -and $_.attributes['org.gradle.category'] -eq 'library' })
-    $apiVariants = @($metadata.variants | Where-Object { $_.attributes['org.gradle.usage'] -eq 'java-api' -and $_.attributes['org.gradle.category'] -eq 'library' })
-    if ($runtimeVariants.Count -ne 1 -or $apiVariants.Count -ne 1) { throw "缺少唯一 API/runtime 发布变体：$module" }
-    if ($module -ne 'log-android' -and $runtimeVariants[0].attributes['org.gradle.jvm.version'] -ne 11) { throw "metadata 未声明 Java 11：$module" }
     $zip = [IO.Compression.ZipFile]::OpenRead($artifact)
     try {
         if ($module -eq 'log-android') {
@@ -138,16 +165,47 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
     } finally { $zip.Dispose() }
     $sourceZip = [IO.Compression.ZipFile]::OpenRead($sources)
     try {
-        if (@($sourceZip.Entries | Where-Object { $_.FullName.EndsWith('.java') }).Count -eq 0) { throw "源码制品为空：$module" }
+        Assert-SourceEntries $sourceZip $module
         Assert-License $sourceZip $module
     } finally { $sourceZip.Dispose() }
-    $checks.Add([pscustomobject]@{ Check='Publication'; Module=$module; Dependencies=$actual; Sources=$sources; License='MIT'; LicenseEntry="META-INF/log-record/$module/LICENSE" })
+    $checks.Add([pscustomobject]@{ Check='Publication'; Module=$module; MetadataPolicy='Pom'; ModuleMetadataAbsent=$true; MarkerAbsent=$true; Packaging=$packaging; Dependencies=$actual; Sources=$sources; License='MIT'; LicenseEntry="META-INF/log-record/$module/LICENSE" })
 }
 
+# 六个消费者必须取得本轮 POM、sources 与二进制；POM 的缺席不能仅由构建成功推导。
+foreach ($mode in @('DefaultMaven','PomOnly')) {
+    $prefix = if ($mode -eq 'DefaultMaven') { 'consumer' } else { 'consumer-pom' }
+    foreach ($entry in @(@('core','log-core'),@('java','log-desktop'),@('android','log-android'))) {
+        $receiptPath = Require-File "consumers/$prefix-$($entry[0])/resolved-artifacts.json"
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+        if ($receipt.mode -cne $mode -or $receipt.module -cne $entry[1] -or $receipt.publicationMetadata -cne 'Pom') { throw "消费者身份或发布策略错误：$receiptPath" }
+        $expectedModules = if ($entry[1] -eq 'log-core') { @('log-core') } else { @('log-core',$entry[1]) }
+        $projectEntries = @($receipt.artifacts | Where-Object group -eq $group)
+        foreach ($module in $expectedModules) {
+            foreach ($kind in @('pom','sources','binary')) {
+                $matches = @($projectEntries | Where-Object { $_.module -eq $module -and
+                    (($kind -eq 'pom' -and $_.configuration -eq 'verificationPoms') -or
+                     ($kind -eq 'sources' -and $_.configuration -eq 'verificationSources') -or
+                     ($kind -eq 'binary' -and $_.configuration -match '(?i)runtimeClasspath$')) })
+                if (!$matches.Count) { throw "消费者缺少 $module/$kind 实际解析证据：$mode" }
+                foreach ($artifact in $matches) {
+                    $suffix = switch ($kind) { 'pom' { '.pom' }; 'sources' { '-sources.jar' }; 'binary' { if ($module -eq 'log-android') { '.aar' } else { '.jar' } } }
+                    $expectedPath = Require-File "m2/com/github/Atian10/log-record/$module/$version/$module-$version$suffix"
+                    if ([IO.Path]::GetFullPath($artifact.path) -cne [IO.Path]::GetFullPath($expectedPath) -or $artifact.version -cne $version -or
+                        $artifact.sha256 -ine (Get-FileHash -LiteralPath $expectedPath).Hash) { throw "消费者文件来源或哈希不同：$mode/$module/$kind" }
+                }
+            }
+        }
+        if ($entry[1] -eq 'log-android') {
+            $bom = @($receipt.artifacts | Where-Object configuration -eq 'verificationBom')
+            if ($bom.Count -ne 1 -or $bom[0].group -cne 'org.jetbrains.kotlin' -or $bom[0].module -cne 'kotlin-bom' -or $bom[0].version -cne '1.8.0' -or
+                $bom[0].extension -cne 'pom' -or $bom[0].sha256 -ine (Get-FileHash -LiteralPath $bom[0].path).Hash) { throw "缺少已核对的 BOM POM 来源：$mode" }
+        }
+        $checks.Add([pscustomobject]@{ Check='ConsumerResolution'; Mode=$mode; Module=$entry[1]; Receipt=$receiptPath; Offline=$receipt.offline; GradleHome=$receipt.gradleHome; MetadataPolicy='Pom' })
+    }
 # 发布消费检查两种 Android 变体，确认 R8 打包未丢失 core/Android 的独立许可。
 foreach ($variant in @('debug','release')) {
-    $apkName = if ($variant -eq 'debug') { 'consumer-android-debug.apk' } else { 'consumer-android-release-unsigned.apk' }
-    $consumerApk = Require-File "modules/consumer-android/outputs/apk/$variant/$apkName"
+    $apkName = if ($variant -eq 'debug') { "$prefix-android-debug.apk" } else { "$prefix-android-release-unsigned.apk" }
+    $consumerApk = Require-File "modules/$prefix-android/outputs/apk/$variant/$apkName"
     $consumerZip = [IO.Compression.ZipFile]::OpenRead($consumerApk)
     try {
         if (!$consumerZip.GetEntry('AndroidManifest.xml') -or !$consumerZip.GetEntry('classes.dex')) { throw "消费 APK 内容不完整：$variant" }
@@ -156,16 +214,17 @@ foreach ($variant in @('debug','release')) {
     } finally { $consumerZip.Dispose() }
     $checks.Add([pscustomobject]@{ Check='ConsumerApkAndLicenses'; Variant=$variant; Artifact=$consumerApk })
 }
-foreach ($consumer in @('consumer-core','consumer-java')) {
+foreach ($consumer in @("$prefix-core","$prefix-java")) {
     $consumerClass = Require-File "modules/$consumer/classes/java/main/Consumer.class"
     $checks.Add([pscustomobject]@{ Check='ConsumerCompilation'; Consumer=$consumer; Artifact=$consumerClass })
 }
-$consumerMapping = Require-File 'modules/consumer-android/outputs/mapping/release/mapping.txt'
-$consumerConfiguration = Require-File 'modules/consumer-android/outputs/mapping/release/configuration.txt'
+$consumerMapping = Require-File "modules/$prefix-android/outputs/mapping/release/mapping.txt"
+$consumerConfiguration = Require-File "modules/$prefix-android/outputs/mapping/release/configuration.txt"
 if ((Get-Content -LiteralPath $consumerConfiguration -Raw) -notmatch 'com\.atian10\.logrecord\.android\.room\.\*\*') {
     throw '消费方 R8 未取得 AAR 的 Room 规则。'
 }
 $checks.Add([pscustomobject]@{ Check='ConsumerR8'; Artifact=$consumerMapping })
+}
 
 if ($Scope -eq 'Publication') {
     # 限定入口不伪造 Tests/Android/Lint 的完整验收结论，也不读取旧报告补齐。
