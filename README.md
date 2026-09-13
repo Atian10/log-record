@@ -2,7 +2,7 @@
 
 跨平台日志记录库，支持 Android、Windows 桌面、Windows 服务器、Linux 服务器。
 
-当前尚无通过完整远程接入验收的版本。提交 `3febf8ceabb1f1701b91e2578fdaafaff30152d4` 的 JitPack 构建成功，但 P5 因远端发布元数据错误而失败，六个消费者均未启动；本轮 POM 发布修复已完成，四个离线限定阶段和六个本地消费者均通过，尚未远端复验。`v2.0.0-rc.1` 仍只是候选规划，设计文档中的 `v1.5` 是历史文档版号。可用本地 Module，项目内 Maven 的验证状态见[公开发布说明](docs/公开发布说明.md)。
+已发布候选版本：[v2.0.0-rc.1](https://github.com/Atian10/log-record/releases/tag/v2.0.0-rc.1)（Pre-release），Git 标签指向提交 `1f0b7bd57c3be700556a37a37505e5f056f06e9f`。精确提交和标签版本均已通过 JitPack 远程发布及独立消费者的编译、打包和依赖检查，可按下方模块坐标接入。验证不包括真机、模拟器、数据库运行或线上业务验收；完整范围与历史失败见[公开发布说明](docs/公开发布说明.md)。设计文档中的 `v1.5` 是历史文档版号。
 
 ## 功能特性
 
@@ -32,7 +32,7 @@
 
 **方式一：按模块使用 Maven 依赖**
 
-第 1 步：在**项目根目录** `build.gradle` 添加 JitPack 仓库：
+第 1 步：添加 JitPack 仓库。下例用于在**项目根目录** `build.gradle` 管理仓库的项目；如果项目使用集中仓库管理，请将同样的仓库条目放入 `settings.gradle` 的 `dependencyResolutionManagement.repositories`：
 
 ```gradle
 allprojects {
@@ -50,13 +50,13 @@ allprojects {
 
 ```gradle
 dependencies {
-    implementation 'com.github.Atian10.log-record:log-android:<已验证的发布版本>'
+    implementation 'com.github.Atian10.log-record:log-android:v2.0.0-rc.1'
 }
 ```
 
-> 这是未来通过远程验收后的坐标格式，`<已验证的发布版本>` 不是可直接使用的版本。已有精确提交的 P5 失败证据，不能把该提交或候选规划填成已验证版本。本轮 POM 修复仅作本地离线验证；远程复验须在另行授权交付新提交后进行。不要使用聚合坐标同时引入 Android 与 Desktop。
+> 上述版本已完成精确提交和同提交标签两轮远程验收。Android 接入只声明 `log-android`，由 POM 传递 core 等依赖；不要使用聚合坐标同时引入 Android 与 Desktop。更换版本后需重新核对该版本的验证状态。
 
-三个库通过 Maven POM 描述模块坐标和传递依赖，并以 `sources` classifier 提供 `<模块名>-<版本>-sources.jar`。本轮停止发布 Gradle Module Metadata（`.module`），同时要求 POM 不含其重定向标记；Java 11 要求仍通过字节码和消费者构建检查。未来 P5 将分别验证默认 Maven 解析和强制 POM 解析，不能将发布策略调整称为原 ModuleOnly 验收通过。
+三个库通过 Maven POM 描述模块坐标和传递依赖，并以 `sources` classifier 提供 `<模块名>-<版本>-sources.jar`。本版本不发布 Gradle Module Metadata（`.module`），POM 不含其重定向标记；Java 11 要求通过字节码和消费者构建检查。P5 已分别验证默认 Maven 解析和强制 POM 解析；这是 POM 发布策略验收，不代表旧 ModuleOnly 验收通过。
 
 Android 库保留 Kotlin BOM 1.8.0，并显式发布 `kotlin-stdlib-jdk7:1.8.0` 和 `kotlin-stdlib-jdk8:1.8.0` 两项运行时依赖，补齐 POM 消费时的标准库对齐，不要求 Maven 接入方另加 BOM 或强制版本规则。首次离线验证发现仅保留 BOM 时仍混入旧 jdk7/jdk8 1.7.20，后续复验结果见公开发布说明；目标版本仍为既定 1.8.0。
 
@@ -99,11 +99,11 @@ dependencies {
 
 ```gradle
 dependencies {
-    implementation 'com.github.Atian10.log-record:log-desktop:<已验证的发布版本>'
+    implementation 'com.github.Atian10.log-record:log-desktop:v2.0.0-rc.1'
 }
 ```
 
-此依赖传递引入 `log-core`、Gson 和 SQLite JDBC，不引入 Android 模块。远程版本仍需单独核验。
+此依赖传递引入 `log-core`、Gson 和 SQLite JDBC，不引入 Android 模块。上面的标签版本已通过默认 Maven／强制 POM 两种模式的独立 Java 消费者编译与依赖检查。
 
 **JAR 文件依赖：**
 
@@ -125,7 +125,7 @@ dependencies {
 
 当前源码包含 flush 目标累计结果及 UNKNOWN、活动操作关闭保护、原子导出发布和容量失败后的仅恢复状态。2026-09-12 的历史验证对应提交 `76497adcfd40aa2c0720464197b64b833f55a259` 所收录的构建输入：固定 AGP 7.4.2、Gradle 7.5、JDK 11；core 116 项、Desktop 33 项测试通过且无跳过；Android Debug/Release 与 R8 构建、四个 Lint 变体、三个库的项目内 Maven 发布、两个独立消费工程编译通过。Lint 为 0 错误，保留 4 类现有警告（两个变体合计 8 条）。
 
-该历史批次修复 Wrapper 启动入口、Java 11 编译/发布配置及 Android 消费方 Kotlin 标准库版本冲突，Room schema 保持一致。本机证据位于 `build/verification/20260912-java11-aligned`，不纳入 Git。后续公开准备的许可和本地产物检查已在 `20260913-publication-local` 通过；这些历史结果均不证明当前 POM 策略修改已经通过。旧提交的 P5 FAILED、当前本地验证和未来远端复验分开记录在[公开发布说明](docs/公开发布说明.md)。
+该历史批次修复 Wrapper 启动入口、Java 11 编译/发布配置及 Android 消费方 Kotlin 标准库版本冲突，Room schema 保持一致。本机证据位于 `build/verification/20260912-java11-aligned`，不纳入 Git。后续公开准备检查和 POM 修复的离线六消费者检查分别通过；旧提交 P5 FAILED、首次离线失败、远程 TLS 中断与后续成功批次均保留，详见[公开发布说明](docs/公开发布说明.md)。本版本精确提交的通过批次为 `20260913-jitpack-1f0b7bd-release-r3`，标签版本的通过批次为 `20260913-jitpack-v2-0-0-rc1-release`，不使用历史测试代替当前远程证据。
 
 - `FlushResult.getSaved()/getFailed()/getDropped()/getUnknown()` 是等待期间增量；`getTargetSaved()/getTargetFailed()/getTargetDropped()/getTargetUnknown()` 包含调用前的历史结果。`isAllPersisted()` 才判断整个目标是否保存成功。
 - `shutdown(0)` 只发起关闭并立即查询状态；管理器等待写入、清理和活动快照结束后关闭其平台数据库。超时结果可由后续调用更新。
@@ -201,7 +201,7 @@ Android 接入方无需额外配置，`log-android` 的 `consumer-rules.pro` 会
 - [功能设计文档](docs/日志记录库-功能设计文档.md) - 96 项功能详细说明
 - [架构设计文档](docs/日志记录库-架构设计文档.md) - 分层架构与设计决策
 - [公开发布说明](docs/公开发布说明.md) - 许可范围、版本策略、发布检查与证据边界
-- [变更记录](CHANGELOG.md) - 未发布改动与候选版本规划
+- [变更记录](CHANGELOG.md) - 版本变更与兼容性说明
 
 ## 技术栈
 
@@ -231,12 +231,12 @@ Android 接入方无需额外配置，`log-android` 的 `consumer-rules.pro` 会
 ./scripts/verify-nondevice.ps1 -JavaHome 'E:\Java\temurin-11' -SdkDirectory 'E:\AndroidDev\Sdk'
 ```
 
-完整入口执行 JVM 合成测试、Android Debug/Release 构建和 Lint、临时 Maven 发布与六个独立消费工程编译，并核对制品和 Room schema。报告、数据库、临时签名、消费者独立可写缓存与制品写入 `build/verification/<RunId>`；已有仓库缓存位于 `.gradle/verification-home`。脚本不安装 SDK/JDK；本轮只授权下述离线限定阶段，不执行完整入口。
+完整入口执行 JVM 合成测试、Android Debug/Release 构建和 Lint、临时 Maven 发布与六个独立消费工程编译，并核对制品和 Room schema。报告、数据库、临时签名、消费者独立可写缓存与制品写入 `build/verification/<RunId>`；已有仓库缓存位于 `.gradle/verification-home`。脚本不安装 SDK/JDK；本版本发布准备未重跑完整入口，执行范围是下述限定阶段和独立 P5。
 
-本轮 POM 修复的离线限定本地检查使用 `-Offline -Stages Environment,Publish,Consumers,PublicationArtifacts`，只执行对应阶段。必须已有固定 Wrapper 分发和所需依赖，缺失即停止，不自动下载；不重跑历史测试或以旧测试结果充当本轮结果。本地按默认 Maven／强制 POM 各验证三个消费者，使用独立可写缓存及已有第三方依赖的只读种子缓存；这不是未来 P5 六消费者的远端空缓存证据。`PublicationArtifacts` 与完整验收的 `Artifacts` 分开，详细入口和证据要求见[公开发布说明](docs/公开发布说明.md)。
+POM 修复的离线限定本地检查使用 `-Offline -Stages Environment,Publish,Consumers,PublicationArtifacts`，只执行对应阶段。必须已有固定 Wrapper 分发和所需依赖，缺失即停止，不自动下载；不以旧测试结果充当新输入的结果。本地按默认 Maven／强制 POM 各验证三个消费者，使用独立可写缓存及已有第三方依赖的只读种子缓存。远端 P5 另用每批六组独立空缓存验证精确提交和标签版本；两类证据分别保存。`PublicationArtifacts` 与完整验收的 `Artifacts` 分开，详细入口和证据要求见[公开发布说明](docs/公开发布说明.md)。
 
-排除真机、模拟器、ADB、安装与运行示例、真实业务数据、正式签名、远程发布以及 Git 提交/推送。构建和 Lint 通过不能证明 Android 设备行为；实际通过范围以该次报告为准。
+本版本验收排除真机、模拟器、ADB、应用安装与运行、初始化、Room／业务数据库执行、真实业务数据和正式签名；未完成线上业务验收。Git 标签和 JitPack 接入验证不代替这些层次，实际通过范围以对应报告为准。
 
 ## License
 
-本项目原创代码使用 [MIT](LICENSE)。随源码分发的 Gradle Wrapper 使用 Apache-2.0；运行依赖保留各自许可。详见 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)、[Apache-2.0 正文](licenses/Apache-2.0.txt)和 [Wrapper 通知](licenses/Gradle-Wrapper-NOTICE.txt)。这些许可说明不表示本轮已经发布源码、标签或远程制品。
+本项目原创代码使用 [MIT](LICENSE)。随源码分发的 Gradle Wrapper 使用 Apache-2.0；运行依赖保留各自许可。详见 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)、[Apache-2.0 正文](licenses/Apache-2.0.txt)和 [Wrapper 通知](licenses/Gradle-Wrapper-NOTICE.txt)。许可适用范围与版本验收范围分别说明。
