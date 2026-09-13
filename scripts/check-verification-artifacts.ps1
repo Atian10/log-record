@@ -90,6 +90,55 @@ function Assert-Java11Classes($Zip, [string]$Label) {
     $checks.Add([pscustomobject]@{ Check='Java11Classes'; Artifact=$Label; Classes=$count; Major=55 })
 }
 
+function Assert-DocumentationExamples([string]$Prefix) {
+    foreach ($platform in @('android','java')) {
+        $receiptPath = Require-File "consumers/$Prefix-$platform/documentation-examples.json"
+        $examples = @(Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json)
+        # 包住整个分支输出，避免 Desktop 单元素被 PowerShell 解包成无 Count 的字符串。
+        $expectedMarkers = @(if ($platform -eq 'android') { 'android-init','android-manifest','readme-android-init','javadoc-init','exception-query','android-export' } else { 'javadoc-init' })
+        if ($examples.Count -ne $expectedMarkers.Count -or @($examples | Group-Object Marker | Where-Object Count -ne 1).Count) { throw "文档示例数量或唯一性错误：$receiptPath" }
+        foreach ($example in $examples) {
+            if ($example.Marker -notin $expectedMarkers) { throw "未知示例标记：$($example.Marker)" }
+            $expectedSource = switch ($example.Marker) {
+                'readme-android-init' { 'README.md' }
+                'javadoc-init' { if ($platform -eq 'android') { 'log-android/src/main/java/com/atian10/logrecord/android/AndroidLogInit.java' } else { 'log-desktop/src/main/java/com/atian10/logrecord/desktop/DesktopLogInit.java' } }
+                default { 'docs/使用文档.md' }
+            }
+            if ($example.Source -cne $expectedSource -or $example.SourceSha256 -cne (Get-FileHash -LiteralPath (Join-Path $Workspace $expectedSource)).Hash) { throw "示例不对应当前文档：$receiptPath" }
+            $generated = [IO.Path]::GetFullPath($example.GeneratedFile)
+            $consumerRoot = [IO.Path]::GetFullPath((Join-Path $RunRoot "consumers/$Prefix-$platform")) + [IO.Path]::DirectorySeparatorChar
+            if (!$generated.StartsWith($consumerRoot,[StringComparison]::OrdinalIgnoreCase) -or
+                $example.GeneratedSha256 -cne (Get-FileHash -LiteralPath $generated).Hash -or
+                [string]::IsNullOrWhiteSpace($example.Snippet) -or !(Get-Content -LiteralPath $generated -Raw).Contains([string]$example.Snippet)) { throw "生成示例已变化或未保留原始调用：$receiptPath" }
+            if ($example.Marker -ne 'android-manifest') {
+                $className = [IO.Path]::GetFileNameWithoutExtension($generated)
+                $classRelative = if ($platform -eq 'android') { "modules/$Prefix-android/intermediates/javac/debug/classes/com/atian10/logrecord/verification/$className.class" } else { "modules/$Prefix-java/classes/java/main/$className.class" }
+                $compiledClass = Require-File $classRelative
+                $checks.Add([pscustomobject]@{ Check='DocumentationCompilation'; Consumer="$Prefix-$platform"; Source=$example.Source; Marker=$example.Marker; SourceSha256=$example.SourceSha256; Generated=$generated; CompiledClass=$compiledClass; ClassSha256=(Get-FileHash -LiteralPath $compiledClass).Hash; Executed=$false })
+            }
+        }
+    }
+}
+
+function Assert-ConsumerManifestCases([string]$Prefix) {
+    $receiptPath = Require-File "consumers/$Prefix-android/manifest-cases.json"
+    $cases = @(Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json)
+    $expectedValues = @{ backupTrue='true'; backupFalse='false'; backupOmitted='' }
+    if ($cases.Count -ne 3 -or @($cases | Group-Object Variant | Where-Object Count -ne 1).Count) { throw "Manifest 用例不完整：$receiptPath" }
+    foreach ($case in $cases) {
+        if (!$expectedValues.ContainsKey($case.Variant)) { throw "未知 Manifest 用例：$receiptPath" }
+        $path = Require-File "modules/$Prefix-android/intermediates/merged_manifest/$($case.Variant)/AndroidManifest.xml"
+        [xml]$manifest = Get-Content -LiteralPath $path -Raw
+        $application = $manifest.SelectSingleNode('/manifest/application')
+        $expected = $expectedValues[$case.Variant]
+        if (!$application -or $case.Path -cne $path -or $case.Sha256 -cne (Get-FileHash -LiteralPath $path).Hash -or
+            $case.Expected -cne $expected -or $case.Actual -cne $expected -or
+            $application.GetAttribute('allowBackup','http://schemas.android.com/apk/res/android') -cne $expected -or
+            $application.GetAttribute('name','http://schemas.android.com/apk/res/android') -cne 'com.atian10.logrecord.verification.MyApp') { throw "Manifest 属性或 Application 注册不一致：$path" }
+        $checks.Add([pscustomobject]@{ Check='ConsumerManifest'; Consumer="$Prefix-android"; Variant=$case.Variant; AllowBackup=$expected; Manifest=$path; Sha256=$case.Sha256; Application='com.atian10.logrecord.verification.MyApp'; ApplicationExecuted=$false })
+    }
+}
+
 foreach ($module in @('log-core','log-desktop','log-android')) {
     $repositoryPath = "m2/com/github/Atian10/log-record/$module/$version/$module-$version"
     $extension = if ($module -eq 'log-android') { 'aar' } else { 'jar' }
@@ -145,6 +194,10 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
             if (($rules -replace '\r\n', "`n").Trim() -cne ($sourceRules -replace '\r\n', "`n").Trim()) { throw 'AAR 未完整携带 consumer rules。' }
             $manifest = Read-ZipText $zip 'AndroidManifest.xml'
             if ($manifest -notmatch 'minSdkVersion="21"') { throw 'AAR minSdk 与固定要求不同。' }
+            [xml]$aarManifest = $manifest
+            $application = $aarManifest.SelectSingleNode('/manifest/application')
+            if ($application -and $application.HasAttribute('allowBackup','http://schemas.android.com/apk/res/android')) { throw '库 AAR 仍在设置消费应用的 allowBackup。' }
+            $checks.Add([pscustomobject]@{ Check='LibraryBackupPolicyAbsent'; Artifact=$artifact; AllowBackupAbsent=$true })
             $classesEntry = $zip.GetEntry('classes.jar')
             if (!$classesEntry) { throw 'AAR 缺少 classes.jar。' }
             $classesStream = $classesEntry.Open()
@@ -174,6 +227,8 @@ foreach ($module in @('log-core','log-desktop','log-android')) {
 # 六个消费者必须取得本轮 POM、sources 与二进制；POM 的缺席不能仅由构建成功推导。
 foreach ($mode in @('DefaultMaven','PomOnly')) {
     $prefix = if ($mode -eq 'DefaultMaven') { 'consumer' } else { 'consumer-pom' }
+    Assert-DocumentationExamples $prefix
+    Assert-ConsumerManifestCases $prefix
     foreach ($entry in @(@('core','log-core'),@('java','log-desktop'),@('android','log-android'))) {
         $receiptPath = Require-File "consumers/$prefix-$($entry[0])/resolved-artifacts.json"
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json

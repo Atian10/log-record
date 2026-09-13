@@ -4,6 +4,8 @@
 
 已发布候选版本：[v2.0.0-rc.1](https://github.com/Atian10/log-record/releases/tag/v2.0.0-rc.1)（Pre-release），Git 标签指向提交 `1f0b7bd57c3be700556a37a37505e5f056f06e9f`。精确提交和标签版本均已通过 JitPack 远程发布及独立消费者的编译、打包和依赖检查，可按下方模块坐标接入。验证不包括真机、模拟器、数据库运行或线上业务验收；完整范围与历史失败见[公开发布说明](docs/公开发布说明.md)。设计文档中的 `v1.5` 是历史文档版号。
 
+**当前工作区已实施六项接入与控制台修复，尚未发布。** 下方 `v2.0.0-rc.1` 坐标和历史验收保持不变，该版本仍包含本次修复针对的问题；本页更新后的控制台契约对应未发布源码，不能据此认为旧制品已修复。改动与验证进度见 [Unreleased](CHANGELOG.md#unreleased)。
+
 ## 功能特性
 
 - 多级别日志写入（DEBUG / INFO / WARN / ERROR / FATAL）
@@ -13,7 +15,7 @@
 - 日志导出（TXT / JSON / CSV，编码可选；一致性快照边界 + 统一失败契约 + 原子发布）
 - 自动清理（表级按天数/数量 + 全库磁盘容量预算 `databaseMaxSizeMB`，旧容量参数自动迁移）
 - 异步写入引擎（单线程 + 批处理；flush/shutdown 带超时结果 `FlushResult`/`ShutdownResult`）
-- 运行时动态修改配置（含 formatter，导出按次生效）
+- 运行时动态修改配置（含 formatter；未发布修复让控制台按次快照生效，导出按次生效）
 - 异常独立存储与查询
 
 ## 模块说明
@@ -138,18 +140,32 @@ Gson 和 SQLite JDBC 仍通过 `mavenCentral()` 解析；手动文件接入未�
 
 ### Android
 
+先在已注册的 `Application.onCreate()` 中初始化，在 `super.onCreate()` 之后添加以下调用。新建 `MyApp extends Application` 的完整类示例见[使用文档](docs/使用文档.md#初始化)；已有自定义 Application 时，把初始化调用合入已有类并保留其 Manifest 注册。需要导入 `com.atian10.logrecord.android.AndroidLogInit`、`com.atian10.logrecord.core.config.LogConfig` 和 `com.atian10.logrecord.core.config.CleanPolicy`。
+
+<!-- verification:readme-android-init -->
 ```java
-// 1. 初始化（Application.onCreate）
 AndroidLogInit.init(this, new LogConfig.Builder()
     .versionTag("1.0.0")
-    .consoleEnabled(true)        // 输出到 Logcat
-    .captureMethodLine(true)     // 捕获方法名/行号
+    .consoleEnabled(true)
+    .captureMethodLine(true)
     .cleanPolicy(CleanPolicy.builder()
         .enable(true)
         .keepDays(7)
         .maxDbSizeMB(50)
         .build()));
+```
 
+在 app 的 `src/main/AndroidManifest.xml` 中注册，与 Java 包名保持一致；将属性合入现有 `<application>`，不要创建第二个节点：
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:name=".MyApp" />
+</manifest>
+```
+
+初始化后的业务调用：
+
+```java
 // 2. 写日志
 LogManager.get().i("MainActivity", "页面加载完成");
 LogManager.get().e("NetworkService", "请求失败", throwable);
@@ -163,17 +179,36 @@ new Thread(() -> {
             .build());
 }).start();
 
-// 4. 导出日志（含数据库与文件 IO，必须在子线程！）
-//    cleanNow / flush(long) / shutdown(long) 同样为阻塞或数据库操作，勿在主线程调用
-backgroundExecutor.execute(() ->
-    LogManager.get().exportLogs(
-        LogQuery.builder().build(),
-        ExportFormat.JSON,
-        outputPath,
-        callback));
 ```
 
+导出使用应用内部可写目录，在后台线程执行。以下方法接收 Activity 或 Application 提供的 `Context`；所用类型及完整回调示例见[使用文档](docs/使用文档.md#导出日志)。
+
+```java
+import android.content.Context;
+import java.io.File;
+import java.util.concurrent.Executor;
+import com.atian10.logrecord.core.LogManager;
+import com.atian10.logrecord.core.export.ExportCallback;
+import com.atian10.logrecord.core.export.ExportFormat;
+import com.atian10.logrecord.core.query.LogQuery;
+
+public final class LogExportExample {
+    public static void export(Context context, Executor backgroundExecutor,
+                              ExportCallback callback) {
+        String outputPath = new File(context.getFilesDir(), "logs.json").getAbsolutePath();
+        backgroundExecutor.execute(() -> LogManager.get().exportLogs(
+            LogQuery.builder().build(), ExportFormat.JSON, outputPath, callback));
+    }
+}
+```
+
+`cleanNow`、`flush(long)`、`shutdown(long)` 同样涉及数据库或阻塞等待，勿在 Android 主线程调用。
+
+未发布源码由 `LogManager` 统一读取每次写入的 `consoleEnabled` 与 formatter 快照，支持初始 true/false 后双向切换。平台入口注入独立控制台策略；提交引擎后在调用线程同步输出，Logcat/控制台可见不表示落盘。自定义 formatter 使用 TXT，设为 null 恢复平台默认文本；详细错误和关闭边界见[使用文档](docs/使用文档.md#控制台与格式化未发布修复)。
+
 ### 桌面/服务器
+
+`dbPath` 应由业务方选择当前进程可写的目录；下例 `/var/log/myapp` 需事先存在并具有权限。Desktop 导出另传业务可写的文件绝对路径，不使用 Android 的 `Context` 或 `/sdcard`。
 
 ```java
 // 1. 初始化

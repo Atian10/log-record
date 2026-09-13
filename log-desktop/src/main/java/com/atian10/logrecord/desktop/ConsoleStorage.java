@@ -1,8 +1,12 @@
 package com.atian10.logrecord.desktop;
 
+import com.atian10.logrecord.core.IConsoleOutput;
 import com.atian10.logrecord.core.IExportSnapshot;
+import com.atian10.logrecord.core.IFormatter;
 import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.config.CleanPolicy;
+import com.atian10.logrecord.core.export.ExportFormat;
+import com.atian10.logrecord.core.model.ExceptionRecord;
 import com.atian10.logrecord.core.model.LogLevel;
 import com.atian10.logrecord.core.model.LogRecord;
 import com.atian10.logrecord.core.query.LogQuery;
@@ -13,7 +17,7 @@ import java.io.PrintStream;
 import java.util.List;
 
 /**
- * 控制台输出装饰器（桌面/服务器）
+ * 控制台输出策略工厂及兼容存储装饰器（桌面/服务器）
  * <p>
  * 实现 {@link IStorage}，作为 {@link JdbcStorage} 的装饰器。
  * 写入时先输出到 {@link System#out} / {@link System#err}，再转发给 delegate 持久化。
@@ -21,8 +25,9 @@ import java.util.List;
  * </p>
  * <p>
  * 使用方式：{@code new ConsoleStorage(new JdbcStorage(helper), consoleEnabled)}
- * DesktopLogInit 根据 LogConfig.consoleEnabled 决定是否启用控制台输出，
- * 同时将 LogManager 自身的 consoleEnabled 置为 false，避免装饰器与 LogManager 重复输出。
+ * 此构造器的开关在创建后固定。DesktopLogInit 使用 {@link #consoleOutput()} 提供独立策略，
+ * 由 LogManager 统一处理动态开关，默认初始化不再装饰存储。
+ * 显式使用装饰器时，它是额外输出通道，不应同时开启核心输出以免重复打印。
  * </p>
  */
 public final class ConsoleStorage implements IStorage {
@@ -31,6 +36,45 @@ public final class ConsoleStorage implements IStorage {
     private final boolean enable;
     private final PrintStream out;
     private final PrintStream err;
+
+    /**
+     * 创建使用当前 System.out / System.err 的独立控制台输出策略。
+     * <p>不持有存储，不创建或关闭输出流；动态开关由 LogManager 统一控制。</p>
+     * @return 不拥有存储或关闭资源的输出策略
+     */
+    public static IConsoleOutput consoleOutput() {
+        return consoleOutput(System.out, System.err);
+    }
+
+    /**
+     * 创建使用指定输出流的独立策略，不取得流的关闭权。
+     * <p>在调用线程使用同次配置的 formatter：非 null 时使用 TXT 格式，null 时保留默认文本。
+     * 普通记录保留级别路由，异常记录仅输出到 err；不缓存开关、不提交记录、不捕获输出异常。</p>
+     * @param out 正常级别输出流，null 时使用当前 System.out
+     * @param err 错误级别输出流，null 时使用当前 System.err
+     * @return 可被并发调用的策略；自定义 formatter 和输出流应自行保证线程安全
+     */
+    public static IConsoleOutput consoleOutput(PrintStream out, PrintStream err) {
+        final PrintStream normalOutput = out == null ? System.out : out;
+        final PrintStream errorOutput = err == null ? System.err : err;
+        return new IConsoleOutput() {
+            @Override
+            public void print(LogRecord record, IFormatter formatter) {
+                String line = formatter == null
+                        ? formatLine(record) : formatter.format(record, ExportFormat.TXT);
+                printConsole(record, line, normalOutput, errorOutput);
+            }
+
+            @Override
+            public void print(ExceptionRecord record, IFormatter formatter) {
+                String line = formatter == null
+                        ? "[EXCEPTION] " + record.getLogTag() + " " + record.getExceptionClass()
+                                + ": " + record.getExceptionMessage() + "\n" + record.getStackTrace()
+                        : formatter.format(record, ExportFormat.TXT);
+                errorOutput.println(line);
+            }
+        };
+    }
 
     /**
      * 构造 Console 装饰器（使用 System.out / System.err）
@@ -136,7 +180,11 @@ public final class ConsoleStorage implements IStorage {
      * 输出单条日志到控制台
      */
     private void printConsole(LogRecord r) {
-        String line = formatLine(r);
+        printConsole(r, formatLine(r), out, err);
+    }
+
+    /** 独立策略和旧装饰器共享同一级别到标准流的映射。 */
+    private static void printConsole(LogRecord r, String line, PrintStream out, PrintStream err) {
         LogLevel level = r.getLevel();
         if (level == LogLevel.WARN || level == LogLevel.ERROR || level == LogLevel.FATAL) {
             err.println(line);
@@ -148,7 +196,7 @@ public final class ConsoleStorage implements IStorage {
     /**
      * 格式化控制台行
      */
-    private String formatLine(LogRecord r) {
+    private static String formatLine(LogRecord r) {
         StringBuilder sb = new StringBuilder(64);
         sb.append('[').append(TimeUtil.formatUtc(r.getTimestamp())).append(']');
         sb.append(' ').append(r.getLevel() == null ? "?" : r.getLevel().name());

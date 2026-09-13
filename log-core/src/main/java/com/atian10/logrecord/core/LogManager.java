@@ -77,6 +77,8 @@ public final class LogManager implements ILogger {
     private final CleanTask cleanTask;
     /** 缺省格式化器（初始化时确定，未配置 formatter 时为 DefaultFormatter）；当前生效值经 {@link #currentFormatter} 读取 */
     private final IFormatter effectiveFormatter;
+    /** 当前实例的无资源输出策略；null 保留核心默认 stdout 输出。 */
+    private final IConsoleOutput consoleOutput;
     /** 内部告警最近一条快照（含 storage/clean/export 等），供业务方诊断 */
     private volatile String lastWarning = null;
     /** 实例生命周期状态 */
@@ -95,10 +97,21 @@ public final class LogManager implements ILogger {
      * @throws IllegalStateException 重复初始化时抛出
      */
     public static synchronized LogManager init(LogConfig config) {
+        return init(config, null);
+    }
+
+    /**
+     * 初始化并绑定平台输出策略；旧入口及配置更新 API 保持兼容。
+     * @param config 配置，不可为 null
+     * @param consoleOutput 无资源且支持并发的输出策略；null 使用核心默认通道
+     * @return 单例实例
+     * @throws IllegalStateException 重复初始化时抛出
+     */
+    public static synchronized LogManager init(LogConfig config, IConsoleOutput consoleOutput) {
         if (instance != null) {
             throw new IllegalStateException("LogManager already initialized");
         }
-        instance = new LogManager(config);
+        instance = new LogManager(config, consoleOutput);
         return instance;
     }
 
@@ -129,11 +142,12 @@ public final class LogManager implements ILogger {
         return instance != null;
     }
 
-    private LogManager(LogConfig config) {
+    private LogManager(LogConfig config, IConsoleOutput consoleOutput) {
         if (config == null) {
             throw new NullPointerException("config == null");
         }
         this.configUpdater = new LogConfigUpdater(config);
+        this.consoleOutput = consoleOutput;
         this.operationGuard = config.getDatabaseOperationGuard() != null
                 ? config.getDatabaseOperationGuard() : new DatabaseOperationGuard();
         this.databaseCloser = config.getDatabaseCloser();
@@ -224,6 +238,11 @@ public final class LogManager implements ILogger {
 
     @Override
     public void recordException(Throwable throwable, String tag) {
+        recordException(throwable, tag, configUpdater.get());
+    }
+
+    /** 独立异常与带 Throwable 的普通日志均沿用调用方已经捕获的配置。 */
+    private void recordException(Throwable throwable, String tag, LogConfig config) {
         if (throwable == null) {
             return;
         }
@@ -234,10 +253,7 @@ public final class LogManager implements ILogger {
         ExceptionRecord record = new ExceptionRecord(
                 timestamp, exceptionClass, exceptionMessage, stackTrace, tag);
         engine.submit(record);
-        if (consoleEnabled()) {
-            printConsole("[EXCEPTION] " + tag + " " + exceptionClass
-                    + ": " + exceptionMessage + "\n" + stackTrace);
-        }
+        printConsole(record, config);
     }
 
     @Override
@@ -345,12 +361,10 @@ public final class LogManager implements ILogger {
         engine.submit(record);
         // 异常独立写入
         if (throwable != null) {
-            recordException(throwable, tag);
+            recordException(throwable, tag, config);
         }
         // 控制台输出
-        if (config.isConsoleEnabled()) {
-            printConsole(formatForConsole(record));
-        }
+        printConsole(record, config);
     }
 
     /**
@@ -391,18 +405,44 @@ public final class LogManager implements ILogger {
                 userFields);
     }
 
-    private boolean consoleEnabled() {
-        return configUpdater.get().isConsoleEnabled();
+    /**
+     * 每条记录仅分发一次；开关和 formatter 来自同一调用快照。
+     * 不在管理器/数据库锁内执行外部代码；控制台输出不是保存成功凭证。
+     */
+    private void printConsole(LogRecord record, LogConfig config) {
+        if (!config.isConsoleEnabled() || lifecycle != Lifecycle.RUNNING) return;
+        try {
+            if (consoleOutput != null) {
+                consoleOutput.print(record, config.getFormatter());
+            } else {
+                System.out.println(currentFormatter(config).format(record, ExportFormat.TXT));
+            }
+        } catch (RuntimeException failure) {
+            recordConsoleWarning(failure);
+        }
     }
 
-    private void printConsole(String text) {
-        // 默认输出到 stdout，平台适配层可重写输出通道
-        System.out.println(text);
+    /** 异常详情是独立记录；不会重新读取开关或回退到另一输出通道。 */
+    private void printConsole(ExceptionRecord record, LogConfig config) {
+        if (!config.isConsoleEnabled() || lifecycle != Lifecycle.RUNNING) return;
+        try {
+            if (consoleOutput != null) {
+                consoleOutput.print(record, config.getFormatter());
+            } else if (config.getFormatter() != null) {
+                System.out.println(config.getFormatter().format(record, ExportFormat.TXT));
+            } else {
+                System.out.println("[EXCEPTION] " + record.getLogTag() + " " + record.getExceptionClass()
+                        + ": " + record.getExceptionMessage() + "\n" + record.getStackTrace());
+            }
+        } catch (RuntimeException failure) {
+            recordConsoleWarning(failure);
+        }
     }
 
-    private String formatForConsole(LogRecord record) {
-        // 控制台输出与导出一致使用当前配置的格式化器（未配置时用缺省）
-        return currentFormatter(configUpdater.get()).format(record, ExportFormat.TXT);
+    /** 告警本身不经过输出策略，避免故障递归或重复打印。 */
+    private void recordConsoleWarning(RuntimeException failure) {
+        // 不调用异常对象可覆写的 getMessage，避免告警处理再次抛异常穿透隔离。
+        lastWarning = "console output failed: " + failure.getClass().getName();
     }
 
     // ===== 查询方法 =====

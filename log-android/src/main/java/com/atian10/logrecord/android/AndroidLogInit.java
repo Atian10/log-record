@@ -7,7 +7,6 @@ import androidx.room.Room;
 import androidx.room.RoomDatabase;
 import androidx.sqlite.db.SupportSQLiteDatabase;
 
-import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.LogManager;
 import com.atian10.logrecord.core.config.LogConfig;
 import com.atian10.logrecord.android.room.LogDatabase;
@@ -16,7 +15,7 @@ import com.atian10.logrecord.android.room.LogDatabaseMigrations;
 /**
  * Android 平台初始化入口
  * <p>
- * 封装 LogDatabase 构建 + RoomStorage/RoomExceptionStorage/LogcatStorage 装配 +
+ * 封装 LogDatabase 构建、RoomStorage/RoomExceptionStorage 与 Logcat 输出策略装配，及
  * LogManager 初始化。业务方调用 {@link #init(Context, LogConfig.Builder)} 完成接入。
  * </p>
  * <p>
@@ -35,13 +34,12 @@ import com.atian10.logrecord.android.room.LogDatabaseMigrations;
  * <p>
  * 使用示例：
  * <pre>
- * LogConfig config = LogConfig.builder()
+ * LogConfig.Builder configBuilder = LogConfig.builder()
  *     .consoleEnabled(true)
  *     .captureMethodLine(false)
  *     .versionTag("1.0.0")
- *     .cleanPolicy(CleanPolicy.builder().enable(true).keepDays(7).build())
- *     .build();
- * AndroidLogInit.init(context, config);
+ *     .cleanPolicy(CleanPolicy.builder().enable(true).keepDays(7).build());
+ * AndroidLogInit.init(context, configBuilder);
  * LogManager.get().i("MainActivity", "app started");
  * </pre>
  * </p>
@@ -73,10 +71,10 @@ public final class AndroidLogInit {
      * <ol>
      *   <li>若已初始化，直接返回现有实例（防重复调用导致 DB 连接泄漏）</li>
      *   <li>构建 LogDatabase（含迁移注册）</li>
-     *   <li>构建 RoomStorage（若 consoleEnabled=true，用 LogcatStorage 装饰）</li>
+     *   <li>构建 RoomStorage；控制台输出独立于持久化存储</li>
      *   <li>构建 RoomExceptionStorage</li>
      *   <li>用平台适配的 storage 替换原 config 中的 storage/exceptionStorage</li>
-     *   <li>调用 LogManager.init</li>
+     *   <li>注入 Logcat 输出策略并调用 LogManager.init，保留动态 consoleEnabled 配置</li>
      * </ol>
      * </p>
      * @param context Android Context（建议用 ApplicationContext 避免泄漏）
@@ -103,38 +101,28 @@ public final class AndroidLogInit {
         // 候选数据库成功前不写静态 owner，失败只释放本候选。
         try {
 
-        // 2. 先从 builder 临时构建一次配置，读取 consoleEnabled 等动态配置项
-        // （storage/exceptionStorage 会被覆盖，故先放占位）
-        // 为避免占位 storage 校验失败，先构造真实 storage
+        // 2. 构建真实存储；控制台输出不装饰存储，避免与核心重复输出。
         RoomStorage roomStorage = new RoomStorage(db);
         RoomExceptionStorage exceptionStorage = new RoomExceptionStorage(db);
 
-        // 临时配置读取 consoleEnabled（需 build 后读取）
+        // 保留调用方提供的全部动态配置，包括 consoleEnabled。
         LogConfig tempConfig = configBuilder
                 .storage(roomStorage)
                 .exceptionStorage(exceptionStorage)
                 .build();
-        boolean consoleEnabled = tempConfig.isConsoleEnabled();
 
-        // 3. 根据 consoleEnabled 决定是否用 LogcatStorage 装饰
-        // 注意：LogManager 自身的 consoleEnabled 会被设为 false，避免 System.out 重复输出
-        IStorage effectiveStorage = consoleEnabled
-                ? new LogcatStorage(roomStorage, true)
-                : roomStorage;
-
-        // 4. 重建最终配置：storage 用装饰后的，consoleEnabled 强制 false，
-        //    并注入全库容量协调器（B4：一个数据库一个协调器，与两存储共享 Room 实例）
+        // 3. 注入全库容量协调器：一个数据库一个协调器，与两存储共享 Room 实例。
         RoomCapacityCoordinator coordinator = new RoomCapacityCoordinator(
                 db, roomStorage, exceptionStorage);
         LogConfig finalConfig = LogConfig.builderFrom(tempConfig)
-                .storage(effectiveStorage)
+                .storage(roomStorage)
                 .exceptionStorage(exceptionStorage)
-                .consoleEnabled(false)  // Logcat 输出由装饰器处理，避免 System.out 重复输出
                 .capacityCoordinator(coordinator)
                 .databaseOwner(db.getOperationGuard(), db::close)
                 .build();
 
-        LogManager manager = LogManager.init(finalConfig);
+        // 4. 由核心统一判断开关，平台策略只负责格式与 Logcat 路由。
+        LogManager manager = LogManager.init(finalConfig, LogcatStorage.consoleOutput());
         owner.set(new DatabaseOwner(manager, db));
         return manager;
         } catch (Throwable failure) {

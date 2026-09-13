@@ -1,6 +1,5 @@
 package com.atian10.logrecord.desktop;
 
-import com.atian10.logrecord.core.IStorage;
 import com.atian10.logrecord.core.LogManager;
 import com.atian10.logrecord.core.config.LogConfig;
 import com.atian10.logrecord.core.engine.ShutdownResult;
@@ -11,7 +10,7 @@ import com.atian10.logrecord.desktop.jdbc.LogTableSchema;
 /**
  * 桌面/服务器平台初始化入口
  * <p>
- * 封装 JdbcHelper 构建 + JdbcStorage/JdbcExceptionStorage/ConsoleStorage 装配 +
+ * 封装 JdbcHelper 构建、JdbcStorage/JdbcExceptionStorage 与控制台输出策略装配，及
  * LogManager 初始化。业务方调用 {@link #init(String, LogConfig.Builder)} 完成接入。
  * </p>
  * <p>
@@ -32,13 +31,12 @@ import com.atian10.logrecord.desktop.jdbc.LogTableSchema;
  * <p>
  * 使用示例：
  * <pre>
- * LogConfig config = LogConfig.builder()
+ * LogConfig.Builder configBuilder = LogConfig.builder()
  *     .consoleEnabled(true)
  *     .captureMethodLine(false)
  *     .versionTag("1.0.0")
- *     .cleanPolicy(CleanPolicy.builder().enable(true).keepDays(7).build())
- *     .build();
- * DesktopLogInit.init("/var/log/app/log_record.db", config);
+ *     .cleanPolicy(CleanPolicy.builder().enable(true).keepDays(7).build());
+ * DesktopLogInit.init("/var/log/app/log_record.db", configBuilder);
  * LogManager.get().i("Main", "app started");
  * </pre>
  * </p>
@@ -90,10 +88,10 @@ public final class DesktopLogInit {
      * <ol>
      *   <li>构建局部候选 JdbcHelper（含 WAL 模式 + 建表），成功前不发布任何静态资源</li>
      *   <li>执行数据库迁移（如需）</li>
-     *   <li>构建 JdbcStorage（若 consoleEnabled=true，用 ConsoleStorage 装饰）</li>
+     *   <li>构建 JdbcStorage；控制台输出独立于持久化存储</li>
      *   <li>构建 JdbcExceptionStorage</li>
      *   <li>用平台适配的 storage 替换原 config 中的 storage/exceptionStorage</li>
-     *   <li>调用 LogManager.init；成功后才发布"实例 + helper"所有者对</li>
+     *   <li>注入控制台输出策略并调用 LogManager.init，保留动态 consoleEnabled 配置；成功后才发布"实例 + helper"所有者对</li>
      *   <li>若 registerShutdownHook=true，注册绑定该所有者的 JVM ShutdownHook</li>
      * </ol>
      * 任一步骤失败：关闭候选 helper 并抛出原异常，既有所有者不受影响。
@@ -140,37 +138,29 @@ public final class DesktopLogInit {
             JdbcStorage jdbcStorage = new JdbcStorage(candidate);
             JdbcExceptionStorage exceptionStorage = new JdbcExceptionStorage(candidate);
 
-            // 4. 临时构建配置读取 consoleEnabled
+            // 4. 使用真实存储，保留调用方提供的全部动态配置，包括 consoleEnabled。
             LogConfig tempConfig = configBuilder
                     .storage(jdbcStorage)
                     .exceptionStorage(exceptionStorage)
                     .build();
-            boolean consoleEnabled = tempConfig.isConsoleEnabled();
 
-            // 5. 根据 consoleEnabled 决定是否装饰
-            IStorage effectiveStorage = consoleEnabled
-                    ? new ConsoleStorage(jdbcStorage, true)
-                    : jdbcStorage;
-
-            // 6. 重建最终配置：consoleEnabled 强制 false（控制台输出由装饰器处理），
-            //    并注入全库容量协调器（B4：一个数据库一个协调器，与两存储共享 helper）
+            // 5. 注入全库容量协调器：一个数据库一个协调器，与两存储共享 helper。
             JdbcCapacityCoordinator coordinator = new JdbcCapacityCoordinator(
                     candidate, jdbcStorage, exceptionStorage);
             LogConfig finalConfig = LogConfig.builderFrom(tempConfig)
-                    .storage(effectiveStorage)
+                    .storage(jdbcStorage)
                     .exceptionStorage(exceptionStorage)
-                    .consoleEnabled(false)
                     .capacityCoordinator(coordinator)
                     .databaseOwner(candidate.getOperationGuard(), candidate::close)
                     .build();
 
-            // 7. 核心初始化；成功后才发布所有者对（ISSUE-10：失败不得覆盖既有静态 helper）
-            LogManager manager = LogManager.init(finalConfig);
+            // 6. 核心统一判断控制台开关；初始化成功后才发布所有者对。
+            LogManager manager = LogManager.init(finalConfig, ConsoleStorage.consoleOutput());
             initialized = manager;
             HelperOwner published = new HelperOwner(manager, candidate);
             owner.set(published);
 
-            // 8. 可选注册 JVM ShutdownHook（绑定本次发布的所有者，不经可变静态字段）
+            // 7. 可选注册 JVM ShutdownHook（绑定本次发布的所有者，不经可变静态字段）
             if (registerShutdownHook) {
                 Runtime.getRuntime().addShutdownHook(new Thread(
                         () -> shutdownOwner(published), "log-record-shutdown-hook"));

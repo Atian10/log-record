@@ -33,11 +33,11 @@ $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $results = [Collections.Generic.List[object]]::new()
 
 function Get-BuildInputState {
-    # 哈希覆盖当前源码和构建入口；文档修改不使构建证据失效，生成目录由 Git 忽略规则排除。
+    # 文档示例也是编译输入；无关管理文档仍排除，生成目录由 Git 忽略规则排除。
     $inputPaths = @(& git -C $workspace -c core.quotepath=false ls-files --cached --others --exclude-standard)
     if ($LASTEXITCODE -ne 0) { throw '无法枚举当前构建输入。' }
     $inputPaths += @('local.properties', 'scripts/check-verification-artifacts.ps1')
-    $inputFiles = @($inputPaths | Where-Object { [IO.Path]::GetExtension($_) -ine '.md' } | Sort-Object -Unique | ForEach-Object {
+    $inputFiles = @($inputPaths | Where-Object { [IO.Path]::GetExtension($_) -ine '.md' -or $_ -in @('README.md','docs/使用文档.md') } | Sort-Object -Unique | ForEach-Object {
         # 已删除的跟踪文件也属于输入变化，不能在指纹中静默消失。
         $inputPath = Join-Path $workspace $_
         [pscustomobject]@{ Path=$_; Hash=if (Test-Path -LiteralPath $inputPath -PathType Leaf) { (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash } else { 'MISSING' } }
@@ -320,6 +320,82 @@ function Invoke-GradleVerification([string]$Name, [string[]]$Tasks, [string]$Pro
     Invoke-VerificationProcess $Name (Join-Path $JavaHome 'bin/java.exe') $arguments $ProjectDirectory $processHome
 }
 
+function Get-DocumentationSnippet([string]$Source, [string]$Marker, [string]$Language = 'java') {
+    $sourcePath = Join-Path $workspace $Source
+    $raw = Get-Content -LiteralPath $sourcePath -Raw
+    if ($Marker -eq 'javadoc-init') {
+        $matches = [regex]::Matches($raw, '(?s)<pre>\s*\r?\n(.*?)\r?\n\s*\*\s*</pre>')
+        if ($matches.Count -ne 1) { throw "Javadoc 初始化示例必须唯一：$Source" }
+        $snippet = ([regex]::Replace($matches[0].Groups[1].Value, '(?m)^\s*\* ?', '')).Trim()
+    } else {
+        $fence = ([string][char]96) * 3
+        $pattern = '(?s)<!-- verification:' + [regex]::Escape($Marker) + ' -->\s*' + $fence + $Language + '\s*\r?\n(.*?)\r?\n' + $fence
+        $matches = [regex]::Matches($raw, $pattern)
+        if ($matches.Count -ne 1) { throw "文档示例标记缺失或重复：$Source/$Marker" }
+        $snippet = $matches[0].Groups[1].Value
+    }
+    return [pscustomobject]@{ Source=$Source; SourceSha256=(Get-FileHash -LiteralPath $sourcePath).Hash; Marker=$Marker; Language=$Language; Text=$snippet }
+}
+
+function Write-DocumentationExample($Snippet, [string]$Target, [string]$Prefix = '', [string]$Suffix = '') {
+    # 原始示例不改写调用；只在其前后补编译需要的 imports、类及参数。
+    Write-VerificationText $Target ($Prefix + $Snippet.Text + $Suffix)
+    return [pscustomobject]@{ Source=$Snippet.Source; SourceSha256=$Snippet.SourceSha256; Marker=$Snippet.Marker;
+        Language=$Snippet.Language; Snippet=$Snippet.Text; GeneratedFile=$Target; GeneratedSha256=(Get-FileHash -LiteralPath $Target).Hash }
+}
+
+function New-DocumentationExamples([string]$AndroidConsumer, [string]$JavaConsumer) {
+    $imports = @'
+import com.atian10.logrecord.core.*;
+import com.atian10.logrecord.core.config.*;
+import com.atian10.logrecord.core.model.*;
+import com.atian10.logrecord.core.query.*;
+import com.atian10.logrecord.core.export.*;
+import java.io.File;
+import java.util.List;
+'@
+    $androidImports = "package com.atian10.logrecord.verification;`nimport android.app.Application;`nimport android.content.Context;`nimport com.atian10.logrecord.android.AndroidLogInit;`n$imports`n"
+    $androidRecords = @()
+    $sourceDirectory = Join-Path $AndroidConsumer 'src/main/java/com/atian10/logrecord/verification'
+    $snippet = Get-DocumentationSnippet 'docs/使用文档.md' 'android-init'
+    $androidRecords += Write-DocumentationExample $snippet (Join-Path $sourceDirectory 'MyApp.java') $androidImports
+    $snippet = Get-DocumentationSnippet 'docs/使用文档.md' 'android-manifest' 'xml'
+    $androidRecords += Write-DocumentationExample $snippet (Join-Path $AndroidConsumer 'src/main/AndroidManifest.xml')
+    foreach ($example in @(
+        @{Source='README.md'; Marker='readme-android-init'; Class='ReadmeExample'; Parameters=''},
+        @{Source='log-android/src/main/java/com/atian10/logrecord/android/AndroidLogInit.java'; Marker='javadoc-init'; Class='AndroidJavadocExample'; Parameters='Context context'},
+        @{Source='docs/使用文档.md'; Marker='exception-query'; Class='QueryExample'; Parameters='long startTime, long endTime'},
+        @{Source='docs/使用文档.md'; Marker='android-export'; Class='ExportExample'; Parameters='Context context'}
+    )) {
+        $snippet = Get-DocumentationSnippet $example.Source $example.Marker
+        $prefix = $androidImports + 'public final class ' + $example.Class + ' extends Application {' + "`n    public void example(" + $example.Parameters + ") {`n"
+        $androidRecords += Write-DocumentationExample $snippet (Join-Path $sourceDirectory ($example.Class + '.java')) $prefix "`n    }`n}`n"
+    }
+    Write-VerificationText (Join-Path $AndroidConsumer 'documentation-examples.json') (ConvertTo-Json -InputObject $androidRecords -Depth 6)
+    $snippet = Get-DocumentationSnippet 'log-desktop/src/main/java/com/atian10/logrecord/desktop/DesktopLogInit.java' 'javadoc-init'
+    $prefix = $imports + "`nimport com.atian10.logrecord.desktop.DesktopLogInit;`npublic final class DesktopJavadocExample {`n    public void example() {`n"
+    $javaRecords = @(Write-DocumentationExample $snippet (Join-Path $JavaConsumer 'src/main/java/DesktopJavadocExample.java') $prefix "`n    }`n}`n")
+    Write-VerificationText (Join-Path $JavaConsumer 'documentation-examples.json') (ConvertTo-Json -InputObject $javaRecords -Depth 6)
+}
+
+function Save-ConsumerManifestCases([string]$Prefix) {
+    $records = @()
+    foreach ($case in @(@{Variant='backupTrue';Expected='true'},@{Variant='backupFalse';Expected='false'},@{Variant='backupOmitted';Expected=''})) {
+        $manifestPath = Join-Path $runRoot "modules/$Prefix-android/intermediates/merged_manifest/$($case.Variant)/AndroidManifest.xml"
+        [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+        $application = $manifest.SelectSingleNode('/manifest/application')
+        if (!$application) { throw "合并 Manifest 缺少 application：$manifestPath" }
+        $actual = $application.GetAttribute('allowBackup','http://schemas.android.com/apk/res/android')
+        $applicationName = $application.GetAttribute('name','http://schemas.android.com/apk/res/android')
+        if ($actual -cne $case.Expected -or $applicationName -cne 'com.atian10.logrecord.verification.MyApp') {
+            throw "合并结果不符合应用选择或 MyApp 注册：$manifestPath"
+        }
+        $records += [pscustomobject]@{ Variant=$case.Variant; Expected=$case.Expected; Actual=$actual;
+            Application=$applicationName; Path=$manifestPath; Sha256=(Get-FileHash -LiteralPath $manifestPath).Hash }
+    }
+    Write-VerificationText (Join-Path $runRoot "consumers/$Prefix-android/manifest-cases.json") (ConvertTo-Json -InputObject $records -Depth 5)
+}
+
 function New-ConsumerProjects([string]$Mode) {
     # 每个模式三个独立项目；DefaultMaven 不配置 metadataSources，不能与 PomOnly 同义。
     $repositoryUri = ([uri](Join-Path $runRoot 'm2')).AbsoluteUri
@@ -407,6 +483,10 @@ android {
     compileOptions { sourceCompatibility JavaVersion.VERSION_11; targetCompatibility JavaVersion.VERSION_11 }
     // 消费方 Release 只做未签名打包及 R8，不安装或运行。
     buildTypes {
+        // 仅合并 Manifest，不为这些补充用例安装或运行应用。
+        backupTrue { initWith debug; matchingFallbacks = ['debug'] }
+        backupFalse { initWith debug; matchingFallbacks = ['debug'] }
+        backupOmitted { initWith debug; matchingFallbacks = ['debug'] }
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
@@ -448,6 +528,11 @@ public final class Consumer {
     public static void initialize(Context context) { AndroidLogInit.init(context, new LogConfig.Builder()); }
 }
 '@
+    New-DocumentationExamples $androidConsumer $javaConsumer
+    foreach ($backupCase in @(@{Variant='backupTrue';Value='true'},@{Variant='backupFalse';Value='false'})) {
+        $overlay = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:allowBackup="' + $backupCase.Value + '" /></manifest>'
+        Write-VerificationText (Join-Path $androidConsumer "src/$($backupCase.Variant)/AndroidManifest.xml") $overlay
+    }
     # 本地 Maven 文件来源与原始下载来源分开记账；本轮不访问远端仓库。
     foreach ($entry in @(@($coreConsumer,'log-core'),@($javaConsumer,'log-desktop'),@($androidConsumer,'log-android'))) {
         $consumerPath = $entry[0]; $module = $entry[1]
@@ -599,7 +684,7 @@ Write-VerificationText (Join-Path $runRoot 'scope.init.gradle') ($scopeGuard.Rep
 # 阶段记录共用本次稳定的构建输入指纹；后续每阶段再次核验，避免运行中途换源码。
 $buildInputState = Get-BuildInputState
 # 本轮源码指纹包括未跟踪的新脚本；不把旧 HEAD 单独当成实际验证源码身份。
-$sourcePaths = @(& git -C $workspace -c core.quotepath=false ls-files) + @('jitpack.yml','gradle/verification.init.gradle','scripts/verify-nondevice.ps1','scripts/check-verification-artifacts.ps1')
+$sourcePaths = @(& git -C $workspace -c core.quotepath=false ls-files --cached --others --exclude-standard) + @('jitpack.yml','gradle/verification.init.gradle','scripts/verify-nondevice.ps1','scripts/check-verification-artifacts.ps1')
 $sourceHashes = @($sourcePaths | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath (Join-Path $workspace $_) -PathType Leaf } | ForEach-Object {
     [pscustomobject]@{ Path=$_; Hash=(Get-FileHash -LiteralPath (Join-Path $workspace $_) -Algorithm SHA256).Hash }
 })
@@ -672,9 +757,12 @@ if ('Consumers' -in $Stages) {
         $prefix = if ($mode -eq 'DefaultMaven') { 'consumer' } else { 'consumer-pom' }
         Invoke-GradleVerification "$mode-consume-core" @('classes','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-core")
         Invoke-GradleVerification "$mode-consume-java" @('classes','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-java")
-        Invoke-GradleVerification "$mode-consume-android" @('assembleDebug','assembleRelease','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-android")
+        Invoke-GradleVerification "$mode-consume-android" @('assembleDebug','assembleRelease','processBackupTrueMainManifest','processBackupFalseMainManifest','processBackupOmittedMainManifest','verifyRuntimeGraph') (Join-Path $runRoot "consumers/$prefix-android")
+        Save-ConsumerManifestCases $prefix
         $consumerOutputs += @((Join-Path $runRoot "modules/$prefix-core/classes/java/main"), (Join-Path $runRoot "modules/$prefix-java/classes/java/main"),
-            (Join-Path $runRoot "modules/$prefix-android/outputs/apk"), (Join-Path $runRoot "modules/$prefix-android/outputs/mapping/release"))
+            (Join-Path $runRoot "modules/$prefix-android/outputs/apk"), (Join-Path $runRoot "modules/$prefix-android/outputs/mapping/release"),
+            (Join-Path $runRoot "modules/$prefix-android/intermediates/merged_manifest"), (Join-Path $runRoot "modules/$prefix-android/outputs/logs"),
+            (Join-Path $runRoot "modules/$prefix-android/intermediates/javac/debug/classes"))
     }
     Complete-VerificationStage $consumersReceipt $consumerOutputs
 }
